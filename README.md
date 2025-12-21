@@ -13,13 +13,19 @@ We present SHARP, an approach to photorealistic view synthesis from a single ima
 
 ## Getting started
 
-We recommend to first create a python environment:
+We recommend using [uv](https://docs.astral.sh/uv/) for dependency management. First, install uv if you haven't already:
 
 ```
-conda create -n sharp python=3.13
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Afterwards, you can install the project using
+Then you can install the project and its dependencies:
+
+```
+uv sync
+```
+
+Alternatively, if you prefer to use pip, you can install the dependencies with:
 
 ```
 pip install -r requirements.txt
