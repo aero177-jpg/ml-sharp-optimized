@@ -542,6 +542,7 @@ def save_sog(
     opacities = gaussians.opacities.flatten(0, 1).cpu().numpy()
 
     num_gaussians = len(xyz)
+    xyz_raw = xyz
 
     # Compute image dimensions (roughly square)
     img_width = int(math.ceil(math.sqrt(num_gaussians)))
@@ -674,6 +675,28 @@ def save_sog(
     sh0_img = create_image(sh0_data, img_width, img_height)
 
     # === 6. Create meta.json ===
+    image_height, image_width = image_shape
+    intrinsic = np.array(
+        [
+            f_px,
+            0,
+            image_width * 0.5,
+            0,
+            f_px,
+            image_height * 0.5,
+            0,
+            0,
+            1,
+        ],
+        dtype=np.float32,
+    )
+    extrinsic = np.eye(4, dtype=np.float32)
+    frame = np.array([1, num_gaussians], dtype=np.int32)
+    disparity = 1.0 / xyz_raw[:, 2]
+    disparity_quantiles = np.quantile(disparity, [0.1, 0.9]).astype(np.float32)
+    color_space_index = cs_utils.encode_color_space("sRGB")
+    ply_version = np.array([1, 5, 0], dtype=np.uint8)
+
     meta = {
         "version": 2,
         "count": num_gaussians,
@@ -686,6 +709,15 @@ def save_sog(
         "scales": {"codebook": scale_codebook.tolist(), "files": ["scales.webp"]},
         "quats": {"files": ["quats.webp"]},
         "sh0": {"codebook": sh0_codebook.tolist(), "files": ["sh0.webp"]},
+        "sharp_metadata": {
+            "image_size": [int(image_width), int(image_height)],
+            "intrinsic": intrinsic.flatten().tolist(),
+            "extrinsic": extrinsic.flatten().tolist(),
+            "frame": frame.tolist(),
+            "disparity": disparity_quantiles.tolist(),
+            "color_space": int(color_space_index),
+            "version": ply_version.tolist(),
+        },
     }
 
     # === 7. Save as ZIP archive ===
@@ -693,7 +725,7 @@ def save_sog(
     if path.suffix.lower() != ".sog":
         path = path.with_suffix(".sog")
 
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
         # Save images as lossless WebP
         for name, img in [
             ("means_l.webp", means_l_img),
