@@ -1,5 +1,5 @@
 import { SplatMesh } from "@sparkjsdev/spark";
-import { Color, PerspectiveCamera, Scene, Vector3, WebGLRenderer } from "three";
+import { PerspectiveCamera, Scene, Vector3, WebGLRenderer } from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { computeMaxOffset } from "../trajectory/CameraMatrixUtils";
 import { TrajectoryPlayer } from "../trajectory/TrajectoryPlayer";
@@ -58,9 +58,8 @@ export class GaussianViewer {
 			this.container.clientHeight,
 		);
 
-		// Initialize Three.js scene
+		// Initialize Three.js scene (no background - page background shows through)
 		this.scene = new Scene();
-		this.scene.background = new Color(0x1a1a1a);
 		console.log("[GaussianViewer] Scene created");
 
 		// Initialize camera with OpenCV coordinate convention (Y-down, Z-forward)
@@ -71,8 +70,8 @@ export class GaussianViewer {
 		this.camera.up.set(0, -1, 0); // OpenCV: Y-down
 		console.log("[GaussianViewer] Camera created, aspect:", aspect);
 
-		// Initialize renderer
-		this.renderer = new WebGLRenderer({ antialias: true });
+		// Initialize renderer with transparent background
+		this.renderer = new WebGLRenderer({ antialias: true, alpha: true });
 		this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 		this.renderer.setSize(
 			this.container.clientWidth,
@@ -331,6 +330,27 @@ export class GaussianViewer {
 	setTrajectoryType(type: TrajectoryType): void {
 		this.trajectoryParams.type = type;
 		this.generateTrajectory();
+	}
+
+	updateTrajectoryParam<K extends keyof Omit<TrajectoryParams, "type">>(
+		key: K,
+		value: TrajectoryParams[K],
+	): void {
+		this.trajectoryParams[key] = value;
+		if (this.splatMesh) {
+			this.generateTrajectory();
+		}
+	}
+
+	resetTrajectoryParams(): void {
+		this.trajectoryParams = { ...DEFAULT_TRAJECTORY_PARAMS };
+		if (this.splatMesh) {
+			this.generateTrajectory();
+		}
+	}
+
+	getTrajectoryParams(): TrajectoryParams {
+		return { ...this.trajectoryParams };
 	}
 
 	play(): void {

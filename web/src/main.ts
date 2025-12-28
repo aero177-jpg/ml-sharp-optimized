@@ -1,11 +1,13 @@
-import type { TrajectoryType } from "./trajectory/types";
+import {
+	DEFAULT_TRAJECTORY_PARAMS,
+	type TrajectoryType,
+} from "./trajectory/types";
 import { GaussianViewer } from "./viewer/GaussianViewer";
 
 console.log("[main] Script loaded");
 
 // Get DOM elements
 const containerElement = document.getElementById("canvas-container");
-const viewerFrameElement = document.getElementById("viewer-frame");
 console.log("[main] Container element:", containerElement);
 const fileLoaderElement = document.getElementById("file-loader");
 const fileInputElement = document.getElementById(
@@ -24,6 +26,47 @@ const resetButtonElement = document.getElementById(
 	"reset-btn",
 ) as HTMLButtonElement;
 const loadingElement = document.getElementById("loading");
+
+// Advanced settings elements
+const advancedToggleElement = document.getElementById(
+	"advanced-toggle",
+) as HTMLButtonElement;
+const advancedPanelElement = document.getElementById(
+	"advanced-panel",
+) as HTMLDivElement;
+const maxDisparitySliderElement = document.getElementById(
+	"max-disparity-slider",
+) as HTMLInputElement;
+const maxDisparityInputElement = document.getElementById(
+	"max-disparity-input",
+) as HTMLInputElement;
+const maxZoomSliderElement = document.getElementById(
+	"max-zoom-slider",
+) as HTMLInputElement;
+const maxZoomInputElement = document.getElementById(
+	"max-zoom-input",
+) as HTMLInputElement;
+const distanceSliderElement = document.getElementById(
+	"distance-slider",
+) as HTMLInputElement;
+const distanceInputElement = document.getElementById(
+	"distance-input",
+) as HTMLInputElement;
+const numStepsSliderElement = document.getElementById(
+	"num-steps-slider",
+) as HTMLInputElement;
+const numStepsInputElement = document.getElementById(
+	"num-steps-input",
+) as HTMLInputElement;
+const numRepeatsSliderElement = document.getElementById(
+	"num-repeats-slider",
+) as HTMLInputElement;
+const numRepeatsInputElement = document.getElementById(
+	"num-repeats-input",
+) as HTMLInputElement;
+const resetParamsButtonElement = document.getElementById(
+	"reset-params-btn",
+) as HTMLButtonElement;
 
 if (!containerElement) {
 	throw new Error("Canvas container not found");
@@ -51,17 +94,7 @@ const viewer = new GaussianViewer({
 	onFrameChange: (_frame, _total) => {
 		// Could add a progress indicator here
 	},
-	onAspectRatioChange: (width, height) => {
-		// Update viewer frame aspect ratio based on image metadata
-		console.log("[main] Aspect ratio changed:", width, "x", height);
-		if (viewerFrameElement) {
-			viewerFrameElement.style.aspectRatio = `${width} / ${height}`;
-			// Wait for DOM to update, then resize the renderer to match
-			requestAnimationFrame(() => {
-				viewer.resize();
-			});
-		}
-	},
+	// Canvas stays fixed size - splat renders with empty space around it as needed
 });
 
 console.log("[main] GaussianViewer initialized");
@@ -75,11 +108,27 @@ function hideLoading(): void {
 	loadingElement?.classList.remove("visible");
 }
 
+function setParameterControlsDisabled(disabled: boolean): void {
+	advancedToggleElement.disabled = disabled;
+	maxDisparitySliderElement.disabled = disabled;
+	maxDisparityInputElement.disabled = disabled;
+	maxZoomSliderElement.disabled = disabled;
+	maxZoomInputElement.disabled = disabled;
+	distanceSliderElement.disabled = disabled;
+	distanceInputElement.disabled = disabled;
+	numStepsSliderElement.disabled = disabled;
+	numStepsInputElement.disabled = disabled;
+	numRepeatsSliderElement.disabled = disabled;
+	numRepeatsInputElement.disabled = disabled;
+	resetParamsButtonElement.disabled = disabled;
+}
+
 function enableControls(): void {
 	trajectorySelectElement.disabled = false;
 	playButtonElement.disabled = false;
 	pauseButtonElement.disabled = false;
 	resetButtonElement.disabled = false;
+	setParameterControlsDisabled(false);
 }
 
 function disableControls(): void {
@@ -87,11 +136,14 @@ function disableControls(): void {
 	playButtonElement.disabled = true;
 	pauseButtonElement.disabled = true;
 	resetButtonElement.disabled = true;
+	setParameterControlsDisabled(true);
 }
 
 function updateButtonStates(state: "stopped" | "playing" | "paused"): void {
 	playButtonElement.disabled = state === "playing";
 	pauseButtonElement.disabled = state !== "playing";
+	// Disable parameter controls during playback
+	setParameterControlsDisabled(state === "playing");
 }
 
 // File Loading
@@ -165,6 +217,93 @@ pauseButtonElement?.addEventListener("click", () => {
 
 resetButtonElement?.addEventListener("click", () => {
 	viewer.reset();
+});
+
+// Advanced settings toggle
+advancedToggleElement?.addEventListener("click", () => {
+	const isExpanded = advancedToggleElement.classList.toggle("expanded");
+	advancedPanelElement?.classList.toggle("collapsed", !isExpanded);
+});
+
+// Helper to sync slider and input values
+function syncSliderAndInput(
+	slider: HTMLInputElement,
+	input: HTMLInputElement,
+	onChange: (value: number) => void,
+): void {
+	slider.addEventListener("input", () => {
+		input.value = slider.value;
+		onChange(Number.parseFloat(slider.value));
+	});
+
+	input.addEventListener("input", () => {
+		const value = Number.parseFloat(input.value);
+		if (!Number.isNaN(value)) {
+			const min = Number.parseFloat(slider.min);
+			const max = Number.parseFloat(slider.max);
+			const clampedValue = Math.max(min, Math.min(max, value));
+			slider.value = String(clampedValue);
+			onChange(clampedValue);
+		}
+	});
+
+	input.addEventListener("blur", () => {
+		const value = Number.parseFloat(input.value);
+		const min = Number.parseFloat(slider.min);
+		const max = Number.parseFloat(slider.max);
+		const clampedValue = Math.max(
+			min,
+			Math.min(
+				max,
+				Number.isNaN(value) ? Number.parseFloat(slider.value) : value,
+			),
+		);
+		input.value = String(clampedValue);
+		slider.value = String(clampedValue);
+	});
+}
+
+// Wire up parameter controls
+syncSliderAndInput(
+	maxDisparitySliderElement,
+	maxDisparityInputElement,
+	(value) => viewer.updateTrajectoryParam("maxDisparity", value),
+);
+
+syncSliderAndInput(maxZoomSliderElement, maxZoomInputElement, (value) =>
+	viewer.updateTrajectoryParam("maxZoom", value),
+);
+
+syncSliderAndInput(distanceSliderElement, distanceInputElement, (value) =>
+	viewer.updateTrajectoryParam("distanceMeters", value),
+);
+
+syncSliderAndInput(numStepsSliderElement, numStepsInputElement, (value) =>
+	viewer.updateTrajectoryParam("numSteps", Math.round(value)),
+);
+
+syncSliderAndInput(numRepeatsSliderElement, numRepeatsInputElement, (value) =>
+	viewer.updateTrajectoryParam("numRepeats", Math.round(value)),
+);
+
+// Reset to defaults
+function updateParameterInputsFromDefaults(): void {
+	const defaults = DEFAULT_TRAJECTORY_PARAMS;
+	maxDisparitySliderElement.value = String(defaults.maxDisparity);
+	maxDisparityInputElement.value = String(defaults.maxDisparity);
+	maxZoomSliderElement.value = String(defaults.maxZoom);
+	maxZoomInputElement.value = String(defaults.maxZoom);
+	distanceSliderElement.value = String(defaults.distanceMeters);
+	distanceInputElement.value = String(defaults.distanceMeters);
+	numStepsSliderElement.value = String(defaults.numSteps);
+	numStepsInputElement.value = String(defaults.numSteps);
+	numRepeatsSliderElement.value = String(defaults.numRepeats);
+	numRepeatsInputElement.value = String(defaults.numRepeats);
+}
+
+resetParamsButtonElement?.addEventListener("click", () => {
+	viewer.resetTrajectoryParams();
+	updateParameterInputsFromDefaults();
 });
 
 // Keyboard shortcuts
