@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 import { defineConfig } from "vite";
 
 export default defineConfig({
-	base: "/ml-sharp/",
+	base: "/ml-sharp-web-viewer/",
 	server: {
 		port: 3000,
 	},

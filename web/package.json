@@ -1,5 +1,5 @@
 {
-	"name": "gaussian-splat-viewer",
+	"name": "ml-sharp-web-viewer",
 	"version": "1.0.0",
 	"description": "Web-based 3D Gaussian Splat viewer for SHARP",
 	"type": "module",
