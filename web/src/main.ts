@@ -34,32 +34,17 @@ const advancedToggleElement = document.getElementById(
 const advancedPanelElement = document.getElementById(
 	"advanced-panel",
 ) as HTMLDivElement;
-const maxDisparitySliderElement = document.getElementById(
-	"max-disparity-slider",
-) as HTMLInputElement;
 const maxDisparityInputElement = document.getElementById(
 	"max-disparity-input",
-) as HTMLInputElement;
-const maxZoomSliderElement = document.getElementById(
-	"max-zoom-slider",
 ) as HTMLInputElement;
 const maxZoomInputElement = document.getElementById(
 	"max-zoom-input",
 ) as HTMLInputElement;
-const distanceSliderElement = document.getElementById(
-	"distance-slider",
-) as HTMLInputElement;
 const distanceInputElement = document.getElementById(
 	"distance-input",
 ) as HTMLInputElement;
-const numStepsSliderElement = document.getElementById(
-	"num-steps-slider",
-) as HTMLInputElement;
 const numStepsInputElement = document.getElementById(
 	"num-steps-input",
-) as HTMLInputElement;
-const numRepeatsSliderElement = document.getElementById(
-	"num-repeats-slider",
 ) as HTMLInputElement;
 const numRepeatsInputElement = document.getElementById(
 	"num-repeats-input",
@@ -110,15 +95,10 @@ function hideLoading(): void {
 
 function setParameterControlsDisabled(disabled: boolean): void {
 	advancedToggleElement.disabled = disabled;
-	maxDisparitySliderElement.disabled = disabled;
 	maxDisparityInputElement.disabled = disabled;
-	maxZoomSliderElement.disabled = disabled;
 	maxZoomInputElement.disabled = disabled;
-	distanceSliderElement.disabled = disabled;
 	distanceInputElement.disabled = disabled;
-	numStepsSliderElement.disabled = disabled;
 	numStepsInputElement.disabled = disabled;
-	numRepeatsSliderElement.disabled = disabled;
 	numRepeatsInputElement.disabled = disabled;
 	resetParamsButtonElement.disabled = disabled;
 }
@@ -222,82 +202,53 @@ resetButtonElement?.addEventListener("click", () => {
 // Advanced settings toggle
 advancedToggleElement?.addEventListener("click", () => {
 	const isExpanded = advancedToggleElement.classList.toggle("expanded");
+	advancedToggleElement.setAttribute("aria-expanded", String(isExpanded));
 	advancedPanelElement?.classList.toggle("collapsed", !isExpanded);
 });
 
-// Helper to sync slider and input values
-function syncSliderAndInput(
-	slider: HTMLInputElement,
-	input: HTMLInputElement,
-	onChange: (value: number) => void,
-): void {
-	slider.addEventListener("input", () => {
-		input.value = slider.value;
-		onChange(Number.parseFloat(slider.value));
-	});
-
-	input.addEventListener("input", () => {
-		const value = Number.parseFloat(input.value);
-		if (!Number.isNaN(value)) {
-			const min = Number.parseFloat(slider.min);
-			const max = Number.parseFloat(slider.max);
-			const clampedValue = Math.max(min, Math.min(max, value));
-			slider.value = String(clampedValue);
-			onChange(clampedValue);
-		}
-	});
-
-	input.addEventListener("blur", () => {
-		const value = Number.parseFloat(input.value);
-		const min = Number.parseFloat(slider.min);
-		const max = Number.parseFloat(slider.max);
-		const clampedValue = Math.max(
-			min,
-			Math.min(
-				max,
-				Number.isNaN(value) ? Number.parseFloat(slider.value) : value,
-			),
-		);
-		input.value = String(clampedValue);
-		slider.value = String(clampedValue);
-	});
-}
-
 // Wire up parameter controls
-syncSliderAndInput(
-	maxDisparitySliderElement,
-	maxDisparityInputElement,
-	(value) => viewer.updateTrajectoryParam("maxDisparity", value),
-);
+maxDisparityInputElement?.addEventListener("input", () => {
+	const value = Number.parseFloat(maxDisparityInputElement.value);
+	if (!Number.isNaN(value)) {
+		viewer.updateTrajectoryParam("maxDisparity", value);
+	}
+});
 
-syncSliderAndInput(maxZoomSliderElement, maxZoomInputElement, (value) =>
-	viewer.updateTrajectoryParam("maxZoom", value),
-);
+maxZoomInputElement?.addEventListener("input", () => {
+	const value = Number.parseFloat(maxZoomInputElement.value);
+	if (!Number.isNaN(value)) {
+		viewer.updateTrajectoryParam("maxZoom", value);
+	}
+});
 
-syncSliderAndInput(distanceSliderElement, distanceInputElement, (value) =>
-	viewer.updateTrajectoryParam("distanceMeters", value),
-);
+distanceInputElement?.addEventListener("input", () => {
+	const value = Number.parseFloat(distanceInputElement.value);
+	if (!Number.isNaN(value)) {
+		viewer.updateTrajectoryParam("distanceMeters", value);
+	}
+});
 
-syncSliderAndInput(numStepsSliderElement, numStepsInputElement, (value) =>
-	viewer.updateTrajectoryParam("numSteps", Math.round(value)),
-);
+numStepsInputElement?.addEventListener("input", () => {
+	const value = Number.parseInt(numStepsInputElement.value, 10);
+	if (!Number.isNaN(value)) {
+		viewer.updateTrajectoryParam("numSteps", value);
+	}
+});
 
-syncSliderAndInput(numRepeatsSliderElement, numRepeatsInputElement, (value) =>
-	viewer.updateTrajectoryParam("numRepeats", Math.round(value)),
-);
+numRepeatsInputElement?.addEventListener("input", () => {
+	const value = Number.parseInt(numRepeatsInputElement.value, 10);
+	if (!Number.isNaN(value)) {
+		viewer.updateTrajectoryParam("numRepeats", value);
+	}
+});
 
 // Reset to defaults
 function updateParameterInputsFromDefaults(): void {
 	const defaults = DEFAULT_TRAJECTORY_PARAMS;
-	maxDisparitySliderElement.value = String(defaults.maxDisparity);
 	maxDisparityInputElement.value = String(defaults.maxDisparity);
-	maxZoomSliderElement.value = String(defaults.maxZoom);
 	maxZoomInputElement.value = String(defaults.maxZoom);
-	distanceSliderElement.value = String(defaults.distanceMeters);
 	distanceInputElement.value = String(defaults.distanceMeters);
-	numStepsSliderElement.value = String(defaults.numSteps);
 	numStepsInputElement.value = String(defaults.numSteps);
-	numRepeatsSliderElement.value = String(defaults.numRepeats);
 	numRepeatsInputElement.value = String(defaults.numRepeats);
 }
 

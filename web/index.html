@@ -1,241 +1,53 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ml-sharp web viewer</title>
-    <style>
-      * {
-        margin: 0;
-        padding: 0;
-        box-sizing: border-box;
-      }
-      html, body {
-        width: 100%;
-        height: 100%;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        background: #f5f5f5;
-        color: #333;
-      }
-      #app {
-        width: 100%;
-        height: 100%;
-        display: flex;
-        flex-direction: column;
-        padding: 24px;
-        gap: 16px;
-      }
-      h1 {
-        font-size: 24px;
-        font-weight: 600;
-      }
-      #controls {
-        display: flex;
-        gap: 24px;
-        align-items: flex-start;
-        justify-content: center;
-        flex-wrap: wrap;
-      }
-      .control-group {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-      }
-      .control-group-label {
-        font-size: 11px;
-        font-weight: 500;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        color: rgba(0, 0, 0, 0.4);
-      }
-      .control-group-content {
-        display: flex;
-        gap: 8px;
-        align-items: center;
-      }
-      button, select {
-        padding: 8px 16px;
-        border: 1px solid #ccc;
-        border-radius: 6px;
-        background: #fff;
-        color: #333;
-        font-size: 14px;
-        cursor: pointer;
-        transition: background 0.2s, border-color 0.2s;
-      }
-      button:hover, select:hover {
-        background: #f0f0f0;
-        border-color: #999;
-      }
-      button:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-      select {
-        min-width: 150px;
-      }
-      #file-loader {
-        padding: 8px 16px;
-        border: 2px dashed #ccc;
-        background: #fff;
-        border-radius: 6px;
-        cursor: pointer;
-      }
-      #file-loader:hover {
-        border-color: #999;
-        background: #f9f9f9;
-      }
-      #file-loader.drag-over {
-        border-color: #666;
-        background: #f0f0f0;
-      }
-      #file-input {
-        display: none;
-      }
-      #viewer-frame {
-        overflow: hidden;
-        position: relative;
-        /* Fill available space */
-        flex: 1;
-        width: 100%;
-        min-height: 400px;
-      }
-      #canvas-container {
-        width: 100%;
-        height: 100%;
-      }
-      #loading {
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        display: none;
-        flex-direction: column;
-        align-items: center;
-        gap: 16px;
-        color: #333;
-      }
-      #loading.visible {
-        display: flex;
-      }
-      .spinner {
-        width: 40px;
-        height: 40px;
-        border: 3px solid rgba(0, 0, 0, 0.1);
-        border-top-color: #333;
-        border-radius: 50%;
-        animation: spin 1s linear infinite;
-      }
-      @keyframes spin {
-        to { transform: rotate(360deg); }
-      }
-      #info {
-        font-size: 12px;
-        color: rgba(0, 0, 0, 0.5);
-        text-align: center;
-      }
-      /* Advanced Settings */
-      #advanced-settings-container {
-        position: relative;
-      }
-      #advanced-toggle {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-      }
-      #advanced-toggle .chevron {
-        font-size: 10px;
-        transition: transform 0.2s;
-      }
-      #advanced-toggle.expanded .chevron {
-        transform: rotate(180deg);
-      }
-      #advanced-panel {
-        position: absolute;
-        bottom: 100%;
-        left: 0;
-        z-index: 100;
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-        margin-bottom: 8px;
-        padding: 16px;
-        background: #fff;
-        border: 1px solid #ddd;
-        border-radius: 6px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
-        min-width: 320px;
-      }
-      #advanced-panel.collapsed {
-        display: none;
-      }
-      .param-row {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-      }
-      .param-row label {
-        flex: 0 0 110px;
-        font-size: 13px;
-        color: #555;
-      }
-      .param-inputs {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex: 1;
-      }
-      .param-inputs input[type="range"] {
-        flex: 1;
-        min-width: 80px;
-        cursor: pointer;
-      }
-      .param-inputs input[type="number"] {
-        width: 65px;
-        padding: 6px 8px;
-        border: 1px solid #ccc;
-        border-radius: 4px;
-        font-size: 13px;
-        text-align: center;
-      }
-      .param-inputs input[type="number"]:disabled,
-      .param-inputs input[type="range"]:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-      #reset-params-btn {
-        align-self: flex-start;
-        margin-top: 4px;
-        background: #f0f0f0;
-        font-size: 13px;
-        padding: 6px 12px;
-      }
-    </style>
-  </head>
-  <body>
-    <div id="app">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ml-sharp web viewer</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+
+<body>
+  <div id="app">
+    <div id="sidebar">
       <h1>ml-sharp web viewer</h1>
 
-      <div id="viewer-frame">
-        <div id="canvas-container"></div>
-
-        <div id="loading">
-          <div class="spinner"></div>
-          <span>Loading splat...</span>
-        </div>
-      </div>
-
-      <div id="info">
-        Drag to orbit | Scroll to zoom | Right-drag to pan
-      </div>
-
       <div id="controls">
+        <div class="control-group">
+          <span class="control-group-label">About</span>
+          <div class="control-group-content">
+            <p class="description">
+              Web viewer for Gaussian splats generated by Apple's
+              <a href="https://github.com/apple/ml-sharp" target="_blank" rel="noopener">ml-sharp</a>.
+              Generate your own .ply files using the ml-sharp repo and upload them here to view with animations.
+            </p>
+            <p class="description description-muted">
+              No GPU? Try <a href="https://modal.com" target="_blank" rel="noopener">Modal</a> for cloud compute with a
+              free tier.
+            </p>
+          </div>
+        </div>
+
         <div class="control-group">
           <span class="control-group-label">File</span>
           <div class="control-group-content">
             <div id="file-loader">
               <span>Drop PLY file here or click to browse</span>
               <input type="file" id="file-input" accept=".ply" />
+            </div>
+          </div>
+        </div>
+
+        <div class="control-group">
+          <span class="control-group-label">Controls</span>
+          <div class="control-group-content">
+            <div class="instructions">
+              <span>Drag to orbit</span>
+              <span class="separator">|</span>
+              <span>Scroll to zoom</span>
+              <span class="separator">|</span>
+              <span>Right-drag to pan</span>
             </div>
           </div>
         </div>
@@ -251,64 +63,74 @@
               <option value="forward">Forward</option>
             </select>
 
-            <button id="play-btn" disabled>Play</button>
-            <button id="pause-btn" disabled>Pause</button>
-            <button id="reset-btn" disabled>Reset</button>
+            <div class="button-group">
+              <button id="play-btn" class="btn-primary" disabled>Play</button>
+              <button id="pause-btn" class="btn-secondary" disabled>Pause</button>
+              <button id="reset-btn" class="btn-secondary" disabled>Reset</button>
+            </div>
 
             <!-- Advanced Settings Section -->
             <div id="advanced-settings-container">
-              <button id="advanced-toggle" type="button" disabled>
-                Advanced <span class="chevron">&#9660;</span>
+              <button id="advanced-toggle" class="btn-ghost" type="button" disabled aria-expanded="false"
+                aria-controls="advanced-panel">
+                Advanced <span class="chevron" aria-hidden="true">&#9660;</span>
               </button>
 
-              <div id="advanced-panel" class="collapsed">
+              <div id="advanced-panel" class="collapsed" role="region" aria-label="Advanced animation settings">
                 <div class="param-row">
-                  <label for="max-disparity-slider">Lateral Movement</label>
-                  <div class="param-inputs">
-                    <input type="range" id="max-disparity-slider" min="0" max="0.3" step="0.01" value="0.08" disabled />
-                    <input type="number" id="max-disparity-input" min="0" max="0.3" step="0.01" value="0.08" disabled />
-                  </div>
+                  <label for="max-disparity-input">Lateral Movement</label>
+                  <input type="number" id="max-disparity-input" step="0.01" value="0.08" disabled />
                 </div>
 
                 <div class="param-row">
-                  <label for="max-zoom-slider">Forward Movement</label>
-                  <div class="param-inputs">
-                    <input type="range" id="max-zoom-slider" min="0" max="0.5" step="0.01" value="0.15" disabled />
-                    <input type="number" id="max-zoom-input" min="0" max="0.5" step="0.01" value="0.15" disabled />
-                  </div>
+                  <label for="max-zoom-input">Forward Movement</label>
+                  <input type="number" id="max-zoom-input" step="0.01" value="0.15" disabled />
                 </div>
 
                 <div class="param-row">
-                  <label for="distance-slider">Z Offset</label>
-                  <div class="param-inputs">
-                    <input type="range" id="distance-slider" min="-1" max="1" step="0.01" value="0" disabled />
-                    <input type="number" id="distance-input" min="-1" max="1" step="0.01" value="0" disabled />
-                  </div>
+                  <label for="distance-input">Z Offset</label>
+                  <input type="number" id="distance-input" step="0.01" value="0" disabled />
                 </div>
 
                 <div class="param-row">
-                  <label for="num-steps-slider">Frames/Cycle</label>
-                  <div class="param-inputs">
-                    <input type="range" id="num-steps-slider" min="10" max="240" step="1" value="60" disabled />
-                    <input type="number" id="num-steps-input" min="10" max="240" step="1" value="60" disabled />
-                  </div>
+                  <label for="num-steps-input">Frames/Cycle</label>
+                  <input type="number" id="num-steps-input" step="1" value="60" disabled />
                 </div>
 
                 <div class="param-row">
-                  <label for="num-repeats-slider">Loop Count</label>
-                  <div class="param-inputs">
-                    <input type="range" id="num-repeats-slider" min="1" max="10" step="1" value="1" disabled />
-                    <input type="number" id="num-repeats-input" min="1" max="10" step="1" value="1" disabled />
-                  </div>
+                  <label for="num-repeats-input">Loop Count</label>
+                  <input type="number" id="num-repeats-input" step="1" value="1" disabled />
                 </div>
 
-                <button id="reset-params-btn" type="button" disabled>Reset to Defaults</button>
+                <button id="reset-params-btn" class="btn-secondary btn-sm" type="button" disabled>Reset to
+                  Defaults</button>
               </div>
             </div>
           </div>
         </div>
+
       </div>
     </div>
+
+    <div id="viewer-frame">
+      <div id="canvas-container"></div>
+
+      <div id="loading">
+        <div class="spinner"></div>
+        <span>Loading splat...</span>
+      </div>
+    </div>
+  </div>
+
+    <a href="https://github.com/kstonekuan/ml-sharp-web-viewer" target="_blank" rel="noopener" class="github-link"
+      aria-label="View on GitHub">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path
+          d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+      </svg>
+    </a>
+
     <script type="module" src="/src/main.ts"></script>
-  </body>
+</body>
+
 </html>
