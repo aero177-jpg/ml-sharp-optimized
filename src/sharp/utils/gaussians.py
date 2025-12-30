@@ -538,7 +538,9 @@ def save_sog(
     xyz = gaussians.mean_vectors.flatten(0, 1).cpu().numpy()
     scales = gaussians.singular_values.flatten(0, 1).cpu().numpy()
     quats = gaussians.quaternions.flatten(0, 1).cpu().numpy()
-    colors_linear = gaussians.colors.flatten(0, 1).cpu().numpy()
+    # Convert linear RGB to sRGB for compatibility with public renderers
+    # (same as save_ply and save_splat)
+    colors_srgb = cs_utils.linearRGB2sRGB(gaussians.colors.flatten(0, 1)).cpu().numpy()
     opacities = gaussians.opacities.flatten(0, 1).cpu().numpy()
 
     num_gaussians = len(xyz)
@@ -559,7 +561,7 @@ def save_sog(
     xyz = pad_array(xyz, total_pixels)
     scales = pad_array(scales, total_pixels)
     quats = pad_array(quats, total_pixels)
-    colors_linear = pad_array(colors_linear, total_pixels)
+    colors_srgb = pad_array(colors_srgb, total_pixels)
     opacities = pad_array(opacities, total_pixels)
 
     # Normalize quaternions
@@ -645,7 +647,7 @@ def save_sog(
 
     # === 4. Build SH0 codebook and encode colors ===
     SH_C0 = 0.28209479177387814
-    sh0_coeffs = (colors_linear - 0.5) / SH_C0
+    sh0_coeffs = (colors_srgb - 0.5) / SH_C0
     sh0_flat = sh0_coeffs.flatten()
 
     sh0_percentiles = np.linspace(0, 100, 256)
