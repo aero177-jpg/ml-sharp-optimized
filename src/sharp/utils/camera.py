@@ -15,7 +15,7 @@ import torch
 from .gaussians import Gaussians3D
 from .linalg import eyes
 
-TrajetoryType = Literal["swipe", "shake", "rotate", "rotate_forward"]
+TrajetoryType = Literal["swipe", "shake", "rotate", "rotate_forward", "forward"]
 LookAtMode = Literal["point", "ahead"]
 
 
@@ -100,6 +100,10 @@ def create_eye_trajectory(
         )
     elif params.type == "rotate_forward":
         return create_eye_trajectory_rotate_forward(
+            max_offset_xyz_m, params.distance_m, params.num_steps, params.num_repeats
+        )
+    elif params.type == "forward":
+        return create_eye_trajectory_forward(
             max_offset_xyz_m, params.distance_m, params.num_steps, params.num_repeats
         )
     else:
@@ -198,6 +202,21 @@ def create_eye_trajectory_rotate_forward(
     ]
 
     return eye_positions
+
+
+def create_eye_trajectory_forward(
+    offset_xyz_m: np.ndarray,
+    distance_m: float,
+    num_steps: int,
+    num_repeats: int,
+) -> list[torch.Tensor]:
+    """Create a forward-only trajectory (dolly in/out)."""
+    _, _, offset_z_m = offset_xyz_m
+    eye_positions = [
+        torch.tensor([0.0, 0.0, distance_m + z], dtype=torch.float32)
+        for z in np.linspace(0, offset_z_m, num_steps)
+    ]
+    return eye_positions * num_repeats
 
 
 def create_camera_model(

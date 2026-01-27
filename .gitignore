@@ -164,3 +164,7 @@ cython_debug/
 .DS_STORE
 *.pt
 .aider*
+
+images/
+gaussians/
+renderings/
