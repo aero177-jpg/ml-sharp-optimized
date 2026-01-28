@@ -52,18 +52,45 @@ uv run sharp cloud predict -i photo.jpg -o output/ --gpu h100  # $3.95/hr (faste
 | A100 | $2.50    | High performance  |
 | H100 | $3.95    | Fastest           |
 
-
 ---
 
-## Web Viewer Features
+## 🚀 One-Click Cloud Deployment
 
-- Upload and view generated `.ply` Gaussian Splat files from ml-sharp
-- Multiple camera trajectory animations (rotate, swipe, shake, forward)
-- Interactive orbit controls (drag to orbit, scroll to zoom, right-drag to pan)
-- Adjustable animation parameters
-- No installation required - runs entirely in the browser
+Deploy the FastAPI endpoint to your own Modal account using GitHub Actions.
 
----
+### Prerequisites
+
+1. Create a Modal account and authenticate locally once:
+
+```bash
+uv run modal token new
+```
+
+2. Add the following GitHub Actions secrets in your fork:
+
+- `MODAL_TOKEN_ID`
+- `MODAL_TOKEN_SECRET`
+
+3. Create Modal secrets once (locally):
+
+```bash
+uv run setup_secrets.py
+```
+
+This creates the required Modal secrets:
+
+- `supabase-creds` (SUPABASE_URL, SUPABASE_KEY, SUPABASE_BUCKET)
+- `sharp-api-auth` (API_AUTH_TOKEN)
+
+### Deploy
+
+1. Go to your repo’s Actions tab.
+2. Run the “Deploy Modal API” workflow.
+3. Find the FastAPI URL in your Modal dashboard after deploy.
+
+The workflow deploys [src/sharp/modal/api.py](src/sharp/modal/api.py) to Modal.
+
+
 
 ## Original README from [apple/ml-sharp](https://github.com/apple/ml-sharp)
 

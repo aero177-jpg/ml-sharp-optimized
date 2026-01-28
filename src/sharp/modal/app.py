@@ -21,13 +21,14 @@ if TYPE_CHECKING:
     from sharp.utils.gaussians import Gaussians3D
 
 LOGGER = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # Modal app configuration
 APP_NAME = "sharp-gaussian-splat"
 VOLUME_NAME = "sharp-model-cache"
 MODEL_CACHE_PATH = "/cache/models"
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
-TIMEOUT_SECONDS = 300
+TIMEOUT_SECONDS = 1200
 
 # GPU type mapping
 GpuTier = Literal["t4", "l4", "a10", "a100", "h100"]
@@ -244,9 +245,12 @@ def _serialize_ply_to_bytes(
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_t4(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_t4(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: tuple[str, ...] = ("ply",),
+) -> list[tuple[str, bytes]]:
     """Run inference on T4 GPU ($0.59/hr, budget option)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_batch_impl(image_batch, export_formats)
 
 
 @app.function(
@@ -255,9 +259,12 @@ def predict_gaussian_splat_t4(image_bytes: bytes, filename: str) -> tuple[str, b
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_l4(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_l4(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: tuple[str, ...] = ("ply",),
+) -> list[tuple[str, bytes]]:
     """Run inference on L4 GPU ($0.80/hr)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_batch_impl(image_batch, export_formats)
 
 
 @app.function(
@@ -266,9 +273,12 @@ def predict_gaussian_splat_l4(image_bytes: bytes, filename: str) -> tuple[str, b
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_a10(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_a10(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: tuple[str, ...] = ("ply",),
+) -> list[tuple[str, bytes]]:
     """Run inference on A10 GPU ($1.10/hr, default)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_batch_impl(image_batch, export_formats)
 
 
 @app.function(
@@ -277,9 +287,12 @@ def predict_gaussian_splat_a10(image_bytes: bytes, filename: str) -> tuple[str, 
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_a100(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_a100(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: tuple[str, ...] = ("ply",),
+) -> list[tuple[str, bytes]]:
     """Run inference on A100 GPU ($2.50/hr)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_batch_impl(image_batch, export_formats)
 
 
 @app.function(
@@ -288,12 +301,18 @@ def predict_gaussian_splat_a100(image_bytes: bytes, filename: str) -> tuple[str,
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
-def predict_gaussian_splat_h100(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def predict_gaussian_splat_h100(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: tuple[str, ...] = ("ply",),
+) -> list[tuple[str, bytes]]:
     """Run inference on H100 GPU ($3.95/hr, fastest)."""
-    return _predict_impl(image_bytes, filename)
+    return _predict_batch_impl(image_batch, export_formats)
 
 
-def _predict_impl(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
+def _predict_batch_impl(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: tuple[str, ...],
+) -> list[tuple[str, bytes]]:
     """Shared implementation for all GPU variants.
 
     This is called by the GPU-specific functions and contains the actual
@@ -303,15 +322,32 @@ def _predict_impl(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
     import torch.nn.functional as F
 
     from sharp.models import PredictorParams, create_predictor
-    from sharp.utils.gaussians import unproject_gaussians
+    from sharp.utils.gaussians import save_sog, save_splat, unproject_gaussians
 
-    LOGGER.info(f"Processing {filename} on Modal GPU")
+    cuda_available = torch.cuda.is_available()
+    device = torch.device("cuda" if cuda_available else "cpu")
 
-    # Load image from bytes
-    image, f_px = _load_image_from_bytes(image_bytes, filename)
-    height, width = image.shape[:2]
+    if not cuda_available:
+        LOGGER.warning("CUDA not available. Falling back to CPU.")
+    else:
+        try:
+            device_name = torch.cuda.get_device_name(0)
+        except Exception as e:
+            device_name = f"<unknown: {e}>"
+        try:
+            device_props = torch.cuda.get_device_properties(0)
+            device_summary = (
+                f"{device_props.name} (cc {device_props.major}.{device_props.minor}, "
+                f"{device_props.total_memory / (1024**3):.1f} GiB)"
+            )
+        except Exception as e:
+            device_summary = f"<unavailable: {e}>"
 
-    device = torch.device("cuda")
+        LOGGER.info("CUDA available: %s", cuda_available)
+        LOGGER.info("CUDA device count: %d", torch.cuda.device_count())
+        LOGGER.info("CUDA device name: %s", device_name)
+        LOGGER.info("CUDA device summary: %s", device_summary)
+        LOGGER.info("CUDA runtime version: %s", torch.version.cuda)
 
     # Load or download model
     model_path = Path(MODEL_CACHE_PATH) / "sharp_model.pt"
@@ -346,49 +382,87 @@ def _predict_impl(image_bytes: bytes, filename: str) -> tuple[str, bytes]:
     gaussian_predictor.eval()
     gaussian_predictor.to(device)
 
+    export_formats_normalized = tuple(
+        dict.fromkeys(fmt.lower() for fmt in export_formats)
+    ) or ("ply",)
+
+    outputs: list[tuple[str, bytes]] = []
     internal_shape = (1536, 1536)
-    image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
-    disparity_factor = torch.tensor([f_px / width]).float().to(device)
 
-    image_resized_pt = F.interpolate(
-        image_pt[None],
-        size=(internal_shape[1], internal_shape[0]),
-        mode="bilinear",
-        align_corners=True,
-    )
+    for image_bytes, filename in image_batch:
+        LOGGER.info("Processing %s on Modal GPU", filename)
 
-    LOGGER.info("Running inference")
-    with torch.no_grad():
-        gaussians_ndc = gaussian_predictor(image_resized_pt, disparity_factor)
+        # Load image from bytes
+        image, f_px = _load_image_from_bytes(image_bytes, filename)
+        height, width = image.shape[:2]
 
-    intrinsics = (
-        torch.tensor(
-            [
-                [f_px, 0, width / 2, 0],
-                [0, f_px, height / 2, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
+        image_pt = (
+            torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
         )
-        .float()
-        .to(device)
-    )
+        disparity_factor = torch.tensor([f_px / width]).float().to(device)
 
-    intrinsics_resized = intrinsics.clone()
-    intrinsics_resized[0] *= internal_shape[0] / width
-    intrinsics_resized[1] *= internal_shape[1] / height
+        image_resized_pt = F.interpolate(
+            image_pt[None],
+            size=(internal_shape[1], internal_shape[0]),
+            mode="bilinear",
+            align_corners=True,
+        )
 
-    gaussians = unproject_gaussians(
-        gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
-    )
+        LOGGER.info("Running inference")
+        with torch.no_grad():
+            gaussians_ndc = gaussian_predictor(image_resized_pt, disparity_factor)
 
-    LOGGER.info("Serializing to PLY")
-    ply_bytes = _serialize_ply_to_bytes(gaussians, f_px, (height, width))
+        intrinsics = (
+            torch.tensor(
+                [
+                    [f_px, 0, width / 2, 0],
+                    [0, f_px, height / 2, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ]
+            )
+            .float()
+            .to(device)
+        )
 
-    output_filename = Path(filename).stem + ".ply"
-    LOGGER.info(f"Done processing {filename}")
+        intrinsics_resized = intrinsics.clone()
+        intrinsics_resized[0] *= internal_shape[0] / width
+        intrinsics_resized[1] *= internal_shape[1] / height
 
-    return output_filename, ply_bytes
+        gaussians = unproject_gaussians(
+            gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
+        )
+
+        def _serialize_output(fmt: str) -> tuple[str, bytes]:
+            fmt_lower = fmt.lower()
+            output_stem = Path(filename).stem
+            if fmt_lower == "ply":
+                LOGGER.info("Serializing to PLY")
+                return (
+                    f"{output_stem}.ply",
+                    _serialize_ply_to_bytes(gaussians, f_px, (height, width)),
+                )
+
+            if fmt_lower not in {"splat", "sog"}:
+                raise ValueError(f"Unsupported export format: {fmt}")
+
+            import tempfile
+
+            output_filename = f"{output_stem}.{fmt_lower}"
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                output_path = Path(tmp_dir) / output_filename
+                if fmt_lower == "splat":
+                    LOGGER.info("Serializing to SPLAT")
+                    save_splat(gaussians, f_px, (height, width), output_path)
+                else:
+                    LOGGER.info("Serializing to SOG")
+                    save_sog(gaussians, f_px, (height, width), output_path)
+                return output_filename, output_path.read_bytes()
+
+        outputs.extend(_serialize_output(fmt) for fmt in export_formats_normalized)
+        LOGGER.info("Done processing %s", filename)
+
+    return outputs
 
 
 def get_predict_function(gpu_tier: GpuTier = "a10"):

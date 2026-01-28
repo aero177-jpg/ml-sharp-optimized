@@ -534,6 +534,7 @@ def save_sog(
     import json
     import math
     import zipfile
+    from concurrent.futures import ThreadPoolExecutor
 
     from PIL import Image
 
@@ -553,33 +554,25 @@ def save_sog(
     img_height = int(math.ceil(num_gaussians / img_width))
     total_pixels = img_width * img_height
 
-    # Pad arrays to fill image
-    def pad_array(arr: np.ndarray, total: int) -> np.ndarray:
-        if len(arr) < total:
-            pad_shape = (total - len(arr),) + arr.shape[1:]
-            return np.concatenate([arr, np.zeros(pad_shape, dtype=arr.dtype)])
-        return arr
-
-    xyz = pad_array(xyz, total_pixels)
-    scales = pad_array(scales, total_pixels)
-    quats = pad_array(quats, total_pixels)
-    colors_srgb = pad_array(colors_srgb, total_pixels)
-    opacities = pad_array(opacities, total_pixels)
+    # Pad arrays to fill image (vectorized with np.pad)
+    pad_count = total_pixels - num_gaussians
+    if pad_count > 0:
+        xyz = np.pad(xyz, ((0, pad_count), (0, 0)), mode="constant")
+        scales = np.pad(scales, ((0, pad_count), (0, 0)), mode="constant")
+        quats = np.pad(quats, ((0, pad_count), (0, 0)), mode="constant")
+        colors_srgb = np.pad(colors_srgb, ((0, pad_count), (0, 0)), mode="constant")
+        opacities = np.pad(opacities, (0, pad_count), mode="constant")
 
     # Normalize quaternions
     quats = quats / (np.linalg.norm(quats, axis=1, keepdims=True) + 1e-8)
 
     # === 1. Encode positions (16-bit per axis with symmetric log transform) ===
-    def symlog(x: np.ndarray) -> np.ndarray:
-        return np.sign(x) * np.log1p(np.abs(x))
-
-    xyz_log = symlog(xyz)
+    xyz_log = np.sign(xyz) * np.log1p(np.abs(xyz))
     mins = xyz_log.min(axis=0)
     maxs = xyz_log.max(axis=0)
 
     # Avoid division by zero
-    ranges = maxs - mins
-    ranges = np.where(ranges < 1e-8, 1.0, ranges)
+    ranges = np.maximum(maxs - mins, 1e-8)
 
     # Quantize to 16-bit
     xyz_norm = (xyz_log - mins) / ranges
@@ -588,34 +581,30 @@ def save_sog(
     means_l = (xyz_q16 & 0xFF).astype(np.uint8)
     means_u = (xyz_q16 >> 8).astype(np.uint8)
 
-    # === 2. Encode quaternions (smallest-three, 26-bit) ===
-    def encode_quaternion(q: np.ndarray) -> np.ndarray:
-        """Encode quaternion using smallest-three method."""
-        # Find largest component
-        abs_q = np.abs(q)
-        mode = np.argmax(abs_q, axis=1)
+    # === 2. Encode quaternions (fully vectorized smallest-three) ===
+    abs_q = np.abs(quats)
+    mode = np.argmax(abs_q, axis=1)
 
-        # Ensure the largest component is positive
-        signs = np.sign(q[np.arange(len(q)), mode])
-        q = q * signs[:, None]
+    # Ensure largest component is positive
+    row_idx = np.arange(len(quats))
+    signs = np.sign(quats[row_idx, mode])
+    quats = quats * signs[:, None]
 
-        # Extract the three smallest components
-        result = np.zeros((len(q), 4), dtype=np.uint8)
-        sqrt2_inv = 1.0 / math.sqrt(2)
+    # Build mask for kept components (all except mode)
+    all_indices = np.arange(4)
+    mask = all_indices[None, :] != mode[:, None]  # (N, 4) bool mask
 
-        for i in range(len(q)):
-            m = mode[i]
-            # Get indices of the three kept components
-            kept = [j for j in range(4) if j != m]
-            vals = q[i, kept]
-            # Quantize from [-sqrt2/2, sqrt2/2] to [0, 255]
-            encoded = ((vals * sqrt2_inv + 0.5) * 255).clip(0, 255).astype(np.uint8)
-            result[i, :3] = encoded
-            result[i, 3] = 252 + m  # Mode in alpha channel
+    # Extract kept values using the mask
+    kept_vals = quats[mask].reshape(-1, 3)
 
-        return result
+    # Quantize from [-sqrt2/2, sqrt2/2] to [0, 255]
+    sqrt2_inv = 1.0 / math.sqrt(2)
+    encoded_vals = ((kept_vals * sqrt2_inv + 0.5) * 255).clip(0, 255).astype(np.uint8)
 
-    quats_encoded = encode_quaternion(quats)
+    # Build result array
+    quats_encoded = np.zeros((len(quats), 4), dtype=np.uint8)
+    quats_encoded[:, :3] = encoded_vals
+    quats_encoded[:, 3] = (252 + mode).astype(np.uint8)
 
     # === 3. Build scale codebook (256 entries) ===
     # SOG stores scales in LOG space - the renderer does exp(codebook[idx])
@@ -626,24 +615,19 @@ def save_sog(
     percentiles = np.linspace(0, 100, 256)
     scale_codebook = np.percentile(scales_log_flat, percentiles).astype(np.float32)
 
-    # Quantize values to nearest codebook entry
+    # Vectorized quantization to nearest codebook entry
     def quantize_to_codebook(values: np.ndarray, codebook: np.ndarray) -> np.ndarray:
         indices = np.searchsorted(codebook, values)
         indices = np.clip(indices, 0, len(codebook) - 1)
-        # Check if previous index is closer
         prev_indices = np.clip(indices - 1, 0, len(codebook) - 1)
         dist_curr = np.abs(values - codebook[indices])
         dist_prev = np.abs(values - codebook[prev_indices])
-        use_prev = (dist_prev < dist_curr) & (indices > 0)
-        indices = np.where(use_prev, prev_indices, indices)
-        return indices.astype(np.uint8)
+        return np.where(
+            (dist_prev < dist_curr) & (indices > 0), prev_indices, indices
+        ).astype(np.uint8)
 
     scales_q = np.stack(
-        [
-            quantize_to_codebook(scales_log[:, 0], scale_codebook),
-            quantize_to_codebook(scales_log[:, 1], scale_codebook),
-            quantize_to_codebook(scales_log[:, 2], scale_codebook),
-        ],
+        [quantize_to_codebook(scales_log[:, i], scale_codebook) for i in range(3)],
         axis=1,
     )
 
@@ -652,54 +636,45 @@ def save_sog(
     sh0_coeffs = (colors_srgb - 0.5) / SH_C0
     sh0_flat = sh0_coeffs.flatten()
 
-    sh0_percentiles = np.linspace(0, 100, 256)
-    sh0_codebook = np.percentile(sh0_flat, sh0_percentiles).astype(np.float32)
+    sh0_codebook = np.percentile(sh0_flat, percentiles).astype(np.float32)
 
-    sh0_r = quantize_to_codebook(sh0_coeffs[:, 0], sh0_codebook)
-    sh0_g = quantize_to_codebook(sh0_coeffs[:, 1], sh0_codebook)
-    sh0_b = quantize_to_codebook(sh0_coeffs[:, 2], sh0_codebook)
+    sh0_rgb = np.stack(
+        [quantize_to_codebook(sh0_coeffs[:, i], sh0_codebook) for i in range(3)],
+        axis=1,
+    )
     sh0_a = (opacities * 255).clip(0, 255).astype(np.uint8)
 
-    # === 5. Create images ===
-    def create_image(data: np.ndarray, width: int, height: int) -> Image.Image:
+    # === 5. Create images and encode WebP in parallel ===
+    def create_webp_bytes(data: np.ndarray, width: int, height: int) -> bytes:
+        """Create WebP bytes from data array."""
         data = data.reshape(height, width, -1)
-        if data.shape[2] == 3:
-            return Image.fromarray(data, mode="RGB")
-        elif data.shape[2] == 4:
-            return Image.fromarray(data, mode="RGBA")
-        else:
-            raise ValueError(f"Unexpected channel count: {data.shape[2]}")
+        mode = "RGB" if data.shape[2] == 3 else "RGBA"
+        img = Image.fromarray(data, mode=mode)
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP", lossless=True)
+        return buf.getvalue()
 
-    means_l_img = create_image(means_l, img_width, img_height)
-    means_u_img = create_image(means_u, img_width, img_height)
-    quats_img = create_image(quats_encoded, img_width, img_height)
-    scales_img = create_image(scales_q, img_width, img_height)
+    sh0_data = np.concatenate([sh0_rgb, sh0_a[:, None]], axis=1)
 
-    sh0_data = np.stack([sh0_r, sh0_g, sh0_b, sh0_a], axis=1)
-    sh0_img = create_image(sh0_data, img_width, img_height)
+    # Parallel WebP encoding
+    image_data = [
+        ("means_l.webp", means_l),
+        ("means_u.webp", means_u),
+        ("quats.webp", quats_encoded),
+        ("scales.webp", scales_q),
+        ("sh0.webp", sh0_data),
+    ]
+
+    def encode_image(item: tuple[str, np.ndarray]) -> tuple[str, bytes]:
+        name, data = item
+        return name, create_webp_bytes(data, img_width, img_height)
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        encoded_images = list(executor.map(encode_image, image_data))
 
     # === 6. Create meta.json ===
-    image_height, image_width = image_shape
-    intrinsic = np.array(
-        [
-            f_px,
-            0,
-            image_width * 0.5,
-            0,
-            f_px,
-            image_height * 0.5,
-            0,
-            0,
-            1,
-        ],
-        dtype=np.float32,
-    )
-    extrinsic = np.eye(4, dtype=np.float32)
-    frame = np.array([1, num_gaussians], dtype=np.int32)
-    disparity = 1.0 / xyz_raw[:, 2]
-    disparity_quantiles = np.quantile(disparity, [0.1, 0.9]).astype(np.float32)
+    image_height_px, image_width_px = image_shape
     color_space_index = cs_utils.encode_color_space("sRGB")
-    ply_version = np.array([1, 5, 0], dtype=np.uint8)
 
     meta = {
         "version": 2,
@@ -714,13 +689,23 @@ def save_sog(
         "quats": {"files": ["quats.webp"]},
         "sh0": {"codebook": sh0_codebook.tolist(), "files": ["sh0.webp"]},
         "sharp_metadata": {
-            "image_size": [int(image_width), int(image_height)],
-            "intrinsic": intrinsic.flatten().tolist(),
-            "extrinsic": extrinsic.flatten().tolist(),
-            "frame": frame.tolist(),
-            "disparity": disparity_quantiles.tolist(),
+            "image_size": [int(image_width_px), int(image_height_px)],
+            "intrinsic": [
+                f_px,
+                0,
+                image_width_px * 0.5,
+                0,
+                f_px,
+                image_height_px * 0.5,
+                0,
+                0,
+                1,
+            ],
+            "extrinsic": np.eye(4, dtype=np.float32).flatten().tolist(),
+            "frame": [1, num_gaussians],
+            "disparity": np.quantile(1.0 / xyz_raw[:, 2], [0.1, 0.9]).tolist(),
             "color_space": int(color_space_index),
-            "version": ply_version.tolist(),
+            "version": [1, 5, 0],
         },
     }
 
@@ -730,17 +715,6 @@ def save_sog(
         path = path.with_suffix(".sog")
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
-        # Save images as lossless WebP
-        for name, img in [
-            ("means_l.webp", means_l_img),
-            ("means_u.webp", means_u_img),
-            ("quats.webp", quats_img),
-            ("scales.webp", scales_img),
-            ("sh0.webp", sh0_img),
-        ]:
-            buf = io.BytesIO()
-            img.save(buf, format="WEBP", lossless=True)
-            zf.writestr(name, buf.getvalue())
-
-        # Save meta.json
+        for name, data in encoded_images:
+            zf.writestr(name, data)
         zf.writestr("meta.json", json.dumps(meta, indent=2))

@@ -50,8 +50,17 @@ def cloud_cli():
     "-o",
     "--output-path",
     type=click.Path(path_type=Path, file_okay=False),
-    help="Path to save the predicted Gaussians (.ply files).",
+    help="Path to save the predicted Gaussians (PLY/SPLAT/SOG files).",
     required=True,
+)
+@click.option(
+    "-f",
+    "--format",
+    "export_formats",
+    type=click.Choice(["ply", "splat", "sog"], case_sensitive=False),
+    multiple=True,
+    default=["ply"],
+    help="Output format(s). Can specify multiple: -f ply -f splat -f sog",
 )
 @click.option(
     "--gpu",
@@ -59,18 +68,27 @@ def cloud_cli():
     default="a10",
     help="GPU tier. Prices/hr: t4=$0.59, l4=$0.80, a10=$1.10, a100=$2.50, h100=$3.95.",
 )
+@click.option(
+    "--batch-size",
+    type=int,
+    default=20,
+    show_default=True,
+    help="Number of images per cloud batch to avoid Modal timeouts.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
 def cloud_predict_cli(
     input_path: Path,
     output_path: Path,
+    export_formats: tuple[str, ...],
     gpu: GpuTier,
+    batch_size: int,
     verbose: bool,
 ):
     """Predict Gaussians from input images using Modal cloud GPUs.
 
     This command uploads your images to Modal's cloud infrastructure,
     runs inference on the specified GPU tier, and downloads the resulting
-    .ply files to your local machine.
+    files to your local machine.
 
     Examples:
         sharp cloud predict -i photo.jpg -o output/
@@ -78,6 +96,15 @@ def cloud_predict_cli(
         sharp cloud predict -i photos/ -o output/ --gpu a100
     """
     logging_utils.configure(logging.DEBUG if verbose else logging.INFO)
+
+    if batch_size < 1:
+        raise click.BadParameter("batch-size must be >= 1")
+    if batch_size > 20:
+        LOGGER.warning("batch-size capped at 20 (requested %d)", batch_size)
+        batch_size = 20
+
+    # Normalize export formats to lowercase
+    export_formats = tuple(fmt.lower() for fmt in export_formats)
 
     if not check_modal_installed():
         click.echo(
@@ -95,15 +122,27 @@ def cloud_predict_cli(
     from sharp.modal.app import app, get_predict_function
 
     # Find images to process
-    extensions = io.get_supported_image_extensions()
+    extensions = {ext.lower() for ext in io.get_supported_image_extensions()}
     image_paths: list[Path] = []
 
     if input_path.is_file():
-        if input_path.suffix in extensions:
+        if input_path.suffix.lower() in extensions:
             image_paths = [input_path]
     else:
-        for ext in extensions:
-            image_paths.extend(list(input_path.glob(f"**/*{ext}")))
+        seen = set()
+        for candidate_path in input_path.rglob("*"):
+            if not candidate_path.is_file():
+                continue
+            if candidate_path.suffix.lower() not in extensions:
+                continue
+
+            resolved = candidate_path.resolve()
+            if resolved in seen:
+                continue
+
+            seen.add(resolved)
+            image_paths.append(candidate_path)
+        image_paths.sort()
 
     if len(image_paths) == 0:
         LOGGER.info("No valid images found. Input was %s.", input_path)
@@ -117,28 +156,37 @@ def cloud_predict_cli(
     # Get the appropriate function for the GPU tier
     predict_fn = get_predict_function(gpu)
 
-    # Process each image within Modal app context
+    # Process batches within Modal app context
     with app.run():
-        for image_path in image_paths:
-            LOGGER.info("Uploading and processing %s", image_path)
+        total = len(image_paths)
+        for batch_index in range(0, total, batch_size):
+            batch_paths = image_paths[batch_index : batch_index + batch_size]
+            batch_number = batch_index // batch_size + 1
+            batch_count = (total + batch_size - 1) // batch_size
 
-            # Read image bytes
-            image_bytes = image_path.read_bytes()
+            LOGGER.info(
+                "Uploading batch %d/%d with %d image(s)",
+                batch_number,
+                batch_count,
+                len(batch_paths),
+            )
+            image_batch = [
+                (image_path.read_bytes(), image_path.name) for image_path in batch_paths
+            ]
 
-            # Call Modal function
             try:
-                output_filename, ply_bytes = predict_fn.remote(
-                    image_bytes=image_bytes,
-                    filename=image_path.name,
+                outputs = predict_fn.remote(
+                    image_batch=image_batch,
+                    export_formats=export_formats,
                 )
 
-                # Save PLY file
-                output_file = output_path / output_filename
-                output_file.write_bytes(ply_bytes)
-                LOGGER.info("Saved %s", output_file)
+                for output_filename, output_bytes in outputs:
+                    output_file = output_path / output_filename
+                    output_file.write_bytes(output_bytes)
+                    LOGGER.info("Saved %s", output_file)
 
             except Exception as e:
-                LOGGER.error("Failed to process %s: %s", image_path, e)
+                LOGGER.error("Failed to process batch %d/%d: %s", batch_number, batch_count, e)
                 raise
 
     LOGGER.info("Done! Processed %d image(s).", len(image_paths))
@@ -185,7 +233,7 @@ def cloud_setup_cli(verbose: bool):
 
     try:
         with app.run():
-            predict_gaussian_splat_a10.remote(image_bytes=test_bytes, filename="test.png")
+            predict_gaussian_splat_a10.remote(image_batch=[(test_bytes, "test.png")])
         LOGGER.info("Setup complete! Model is cached and ready for inference.")
     except Exception as e:
         error_message = str(e)
