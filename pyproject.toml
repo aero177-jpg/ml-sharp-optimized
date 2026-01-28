@@ -76,3 +76,6 @@ explicit = true
 torch = { index = "pytorch-cu124" }
 torchvision = { index = "pytorch-cu124" }
 torchaudio = { index = "pytorch-cu124" }
+
+[tool.uv]
+pip = ["modal"]

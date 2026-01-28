@@ -16,5 +16,8 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v5
 
+      - name: Install dependencies (cloud)
+        run: uv sync --extra cloud
+
       - name: Deploy Modal app
         run: uv run modal deploy src/sharp/modal/api.py
