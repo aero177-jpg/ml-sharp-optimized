@@ -18,7 +18,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cloud = ["modal>=0.64.0"]
+cloud = [
+  "modal",
+  "fastapi",
+]
 
 [project.scripts]
 sharp = "sharp.cli:main_cli"
