@@ -110,39 +110,39 @@ _WORKER_KWARGS = dict(
 
 
 def _run_batch_impl(
-    image_bytes: bytes, filename: str, export_formats: Sequence[str]
+    image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]
 ) -> list[tuple[str, bytes]]:
     from sharp.modal.app import _predict_batch_impl
 
     return _predict_batch_impl(
-        image_batch=[(image_bytes, filename)],
+        image_batch=image_batch,
         export_formats=tuple(export_formats),
     )
 
 
 @app.function(gpu="a10", **_WORKER_KWARGS)
-def _predict_on_a10(image_bytes: bytes, filename: str, export_formats: Sequence[str]):
-    return _run_batch_impl(image_bytes, filename, export_formats)
+def _predict_on_a10(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
+    return _run_batch_impl(image_batch, export_formats)
 
 
 @app.function(gpu="t4", **_WORKER_KWARGS)
-def _predict_on_t4(image_bytes: bytes, filename: str, export_formats: Sequence[str]):
-    return _run_batch_impl(image_bytes, filename, export_formats)
+def _predict_on_t4(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
+    return _run_batch_impl(image_batch, export_formats)
 
 
 @app.function(gpu="l4", **_WORKER_KWARGS)
-def _predict_on_l4(image_bytes: bytes, filename: str, export_formats: Sequence[str]):
-    return _run_batch_impl(image_bytes, filename, export_formats)
+def _predict_on_l4(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
+    return _run_batch_impl(image_batch, export_formats)
 
 
 @app.function(gpu="a100", **_WORKER_KWARGS)
-def _predict_on_a100(image_bytes: bytes, filename: str, export_formats: Sequence[str]):
-    return _run_batch_impl(image_bytes, filename, export_formats)
+def _predict_on_a100(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
+    return _run_batch_impl(image_batch, export_formats)
 
 
 @app.function(gpu="h100", **_WORKER_KWARGS)
-def _predict_on_h100(image_bytes: bytes, filename: str, export_formats: Sequence[str]):
-    return _run_batch_impl(image_bytes, filename, export_formats)
+def _predict_on_h100(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
+    return _run_batch_impl(image_batch, export_formats)
 
 
 _GPU_DISPATCH = {
@@ -229,12 +229,18 @@ async def process_image(request: Request):
             return Response(status_code=401)
 
     form = await request.form()
-    upload = form.get("file")
-    if upload is None:
-        raise HTTPException(status_code=400, detail="Form field 'file' is required.")
+    uploads = form.getlist("file") or form.getlist("files")
+    if not uploads:
+        raise HTTPException(
+            status_code=400,
+            detail="Form field 'file' (or 'files') is required.",
+        )
 
-    filename = upload.filename or "upload.png"
-    image_bytes = await upload.read()
+    image_batch: list[tuple[bytes, str]] = []
+    for upload in uploads:
+        filename = upload.filename or "upload.png"
+        image_bytes = await upload.read()
+        image_batch.append((image_bytes, filename))
 
     formats_raw = form.get("format") or form.get("formats")
     export_formats: Sequence[str]
@@ -246,13 +252,12 @@ async def process_image(request: Request):
     gpu_request = (form.get("gpu") or form.get("gpu_type") or "a10").strip().lower()
     if gpu_request in _GPU_DISPATCH:
         outputs = await _GPU_DISPATCH[gpu_request].remote.aio(
-            image_bytes=image_bytes,
-            filename=filename,
+            image_batch=image_batch,
             export_formats=export_formats,
         )
     elif gpu_request in {"cpu", "none"}:
         outputs = _predict_batch_impl(
-            image_batch=[(image_bytes, filename)],
+            image_batch=image_batch,
             export_formats=tuple(export_formats),
         )
     else:
