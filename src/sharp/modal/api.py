@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from io import BytesIO
@@ -14,8 +15,12 @@ from fastapi.responses import StreamingResponse
 
 R2_SIGNATURE_VERSION = "s3v4"
 
+logger = logging.getLogger("sharp.modal.api")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+
 # Updated App Name
-APP_NAME = "ml-sharp-optimized"
+APP_NAME = "ml-sharp-optimizedv2"
 
 # Secret names expected to be provisioned in Modal
 SUPABASE_SECRET_NAME = "supabase-creds"
@@ -168,12 +173,13 @@ def _upload_to_r2(*, file_content: bytes, filename: str, config: dict[str, str])
     full_key = f"{prefix}/{filename}".strip("/")
     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
-    s3.put_object(
+    resp = s3.put_object(
         Bucket=config["s3Bucket"],
         Key=full_key,
         Body=file_content,
         ContentType=content_type,
     )
+    logger.info("R2 put_object response: %s", resp)
 
     return f"https://{config['s3Bucket']}.r2.cloudflarestorage.com/{full_key}"
 
@@ -224,6 +230,7 @@ async def process_image(request: Request):
 
     return_mode = (form.get("return") or "supabase").strip().lower()
     if return_mode in {"direct", "download", "stream"}:
+        logger.info("Return mode: direct download/stream (%s)", return_mode)
         boundary = f"sharp-{uuid.uuid4().hex}"
 
         def iter_parts():
@@ -251,6 +258,12 @@ async def process_image(request: Request):
     prefix = form.get("prefix") or ""
 
     if s3_endpoint and s3_access_key_id and s3_secret_access_key and s3_bucket:
+        logger.info(
+            "Upload target: R2 (s3Endpoint=%s, bucket=%s, prefix=%s)",
+            s3_endpoint,
+            s3_bucket,
+            prefix,
+        )
         uploaded_files: list[dict[str, str]] = []
         r2_config = {
             "s3Endpoint": s3_endpoint,
@@ -261,6 +274,7 @@ async def process_image(request: Request):
         }
 
         for output_name, file_bytes in outputs:
+            logger.info("R2 upload start: %s (%d bytes)", output_name, len(file_bytes))
             url = _upload_to_r2(
                 file_content=file_bytes,
                 filename=output_name,
@@ -268,6 +282,7 @@ async def process_image(request: Request):
             )
             object_key = f"{prefix}/{output_name}".strip("/")
             uploaded_files.append({"name": output_name, "path": object_key, "url": url})
+            logger.info("R2 upload complete: %s -> %s", object_key, url)
 
         return {"files": uploaded_files}
 
@@ -283,12 +298,13 @@ async def process_image(request: Request):
     client = create_client(supabase_url, supabase_key)
     prefix = prefix or "collections/default/assets"
 
+    logger.info("Upload target: Supabase (bucket=%s, prefix=%s)", bucket, prefix)
     uploaded_files: list[dict[str, str]] = []
     for output_name, file_bytes in outputs:
         object_key = str(Path(prefix) / output_name)
         file_handle = BytesIO(file_bytes)
 
-        client.storage.from_(bucket).upload(
+        resp = client.storage.from_(bucket).upload(
             object_key,
             file_handle.getvalue(),
             {
@@ -296,8 +312,10 @@ async def process_image(request: Request):
                 "upsert": "true",  # must be str, not bool
             },
         )
+        logger.info("Supabase upload response: %s", resp)
 
         url = client.storage.from_(bucket).get_public_url(object_key)
         uploaded_files.append({"name": output_name, "path": object_key, "url": url})
+        logger.info("Supabase upload complete: %s -> %s", object_key, url)
 
     return {"files": uploaded_files}
