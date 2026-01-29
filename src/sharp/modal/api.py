@@ -155,33 +155,63 @@ _GPU_DISPATCH = {
 
 
 def _upload_to_r2(*, file_content: bytes, filename: str, config: dict[str, str]) -> str:
+    """Upload file to Cloudflare R2 using S3-compatible API."""
     import mimetypes
 
     import boto3
     from botocore.config import Config
+    from botocore.exceptions import ClientError
 
-    s3 = boto3.client(
-        service_name="s3",
-        endpoint_url=config["s3Endpoint"],
-        aws_access_key_id=config["s3AccessKeyId"],
-        aws_secret_access_key=config["s3SecretAccessKey"],
-        region_name="auto",
-        config=Config(signature_version=R2_SIGNATURE_VERSION),
-    )
-
+    endpoint = config["s3Endpoint"]
+    bucket = config["s3Bucket"]
     prefix = config.get("prefix") or ""
     full_key = f"{prefix}/{filename}".strip("/")
     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
-    resp = s3.put_object(
-        Bucket=config["s3Bucket"],
-        Key=full_key,
-        Body=file_content,
-        ContentType=content_type,
+    logger.info(
+        "R2 _upload_to_r2: endpoint=%s bucket=%s key=%s content_type=%s",
+        endpoint,
+        bucket,
+        full_key,
+        content_type,
     )
-    logger.info("R2 put_object response: %s", resp)
 
-    return f"https://{config['s3Bucket']}.r2.cloudflarestorage.com/{full_key}"
+    try:
+        s3 = boto3.client(
+            service_name="s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=config["s3AccessKeyId"],
+            aws_secret_access_key=config["s3SecretAccessKey"],
+            region_name="auto",
+            config=Config(signature_version=R2_SIGNATURE_VERSION),
+        )
+
+        resp = s3.put_object(
+            Bucket=bucket,
+            Key=full_key,
+            Body=file_content,
+            ContentType=content_type,
+        )
+        logger.info("R2 put_object response: status=%s etag=%s", resp.get("ResponseMetadata", {}).get("HTTPStatusCode"), resp.get("ETag"))
+    except ClientError as e:
+        logger.exception("R2 ClientError: %s", e.response.get("Error", {}))
+        raise
+
+    # Construct public URL - use custom base if provided, else default R2 pattern
+    public_base = config.get("s3PublicUrlBase")
+    if public_base:
+        # Custom domain: e.g. https://assets.example.com
+        url = f"{public_base.rstrip('/')}/{full_key}"
+    else:
+        # Default R2 public URL pattern (requires R2.dev subdomain enabled or custom domain)
+        # Note: This may not work if public access isn't configured on the bucket
+        url = f"https://{bucket}.r2.cloudflarestorage.com/{full_key}"
+        logger.warning(
+            "No s3PublicUrlBase provided; using default pattern which may not be publicly accessible: %s",
+            url,
+        )
+
+    return url
 
 
 @app.function(
@@ -228,36 +258,38 @@ async def process_image(request: Request):
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported gpu: {gpu_request}")
 
-    return_mode = (form.get("return") or "supabase").strip().lower()
-    if return_mode in {"direct", "download", "stream"}:
-        logger.info("Return mode: direct download/stream (%s)", return_mode)
-        boundary = f"sharp-{uuid.uuid4().hex}"
-
-        def iter_parts():
-            for output_name, file_bytes in outputs:
-                header = (
-                    f"--{boundary}\r\n"
-                    f"Content-Type: application/octet-stream\r\n"
-                    f"Content-Disposition: attachment; filename=\"{output_name}\"\r\n"
-                    f"Content-Length: {len(file_bytes)}\r\n\r\n"
-                )
-                yield header.encode()
-                yield file_bytes
-                yield b"\r\n"
-            yield f"--{boundary}--\r\n".encode()
-
-        return StreamingResponse(
-            iter_parts(),
-            media_type=f"multipart/mixed; boundary={boundary}",
-        )
-
-    s3_endpoint = form.get("s3Endpoint")
-    s3_access_key_id = form.get("s3AccessKeyId")
-    s3_secret_access_key = form.get("s3SecretAccessKey")
-    s3_bucket = form.get("s3Bucket")
+    # Explicit storage target: "r2" | "supabase" | anything else -> direct download
+    storage_target = (form.get("storageTarget") or "").strip().lower()
     prefix = form.get("prefix") or ""
+    logger.info("Received storageTarget=%r, prefix=%r", storage_target, prefix)
 
-    if s3_endpoint and s3_access_key_id and s3_secret_access_key and s3_bucket:
+    # -------------------------------------------------------------------------
+    # R2 Upload
+    # -------------------------------------------------------------------------
+    if storage_target == "r2":
+        s3_endpoint = form.get("s3Endpoint")
+        s3_access_key_id = form.get("s3AccessKeyId")
+        s3_secret_access_key = form.get("s3SecretAccessKey")
+        s3_bucket = form.get("s3Bucket")
+        s3_public_url_base = form.get("s3PublicUrlBase")  # optional custom domain
+
+        missing = []
+        if not s3_endpoint:
+            missing.append("s3Endpoint")
+        if not s3_access_key_id:
+            missing.append("s3AccessKeyId")
+        if not s3_secret_access_key:
+            missing.append("s3SecretAccessKey")
+        if not s3_bucket:
+            missing.append("s3Bucket")
+
+        if missing:
+            logger.warning("R2 selected but missing fields: %s", missing)
+            raise HTTPException(
+                status_code=400,
+                detail=f"storageTarget=r2 requires: {', '.join(missing)}",
+            )
+
         logger.info(
             "Upload target: R2 (s3Endpoint=%s, bucket=%s, prefix=%s)",
             s3_endpoint,
@@ -271,51 +303,84 @@ async def process_image(request: Request):
             "s3SecretAccessKey": s3_secret_access_key,
             "s3Bucket": s3_bucket,
             "prefix": prefix,
+            "s3PublicUrlBase": s3_public_url_base,
         }
 
         for output_name, file_bytes in outputs:
             logger.info("R2 upload start: %s (%d bytes)", output_name, len(file_bytes))
-            url = _upload_to_r2(
-                file_content=file_bytes,
-                filename=output_name,
-                config=r2_config,
-            )
-            object_key = f"{prefix}/{output_name}".strip("/")
-            uploaded_files.append({"name": output_name, "path": object_key, "url": url})
-            logger.info("R2 upload complete: %s -> %s", object_key, url)
+            try:
+                url = _upload_to_r2(
+                    file_content=file_bytes,
+                    filename=output_name,
+                    config=r2_config,
+                )
+                object_key = f"{prefix}/{output_name}".strip("/")
+                uploaded_files.append({"name": output_name, "path": object_key, "url": url})
+                logger.info("R2 upload complete: %s -> %s", object_key, url)
+            except Exception as e:
+                logger.exception("R2 upload failed for %s", output_name)
+                raise HTTPException(status_code=500, detail=f"R2 upload failed: {e}")
 
         return {"files": uploaded_files}
 
-    supabase_url = os.environ.get(SUPABASE_URL_ENV)
-    supabase_key = os.environ.get(SUPABASE_KEY_ENV)
-    bucket = os.environ.get(SUPABASE_BUCKET_ENV, DEFAULT_BUCKET)
+    # -------------------------------------------------------------------------
+    # Supabase Upload
+    # -------------------------------------------------------------------------
+    if storage_target == "supabase":
+        supabase_url = os.environ.get(SUPABASE_URL_ENV)
+        supabase_key = os.environ.get(SUPABASE_KEY_ENV)
+        bucket = os.environ.get(SUPABASE_BUCKET_ENV, DEFAULT_BUCKET)
 
-    from supabase import create_client
+        from supabase import create_client
 
-    if not supabase_url or not supabase_key:
-        raise HTTPException(status_code=500, detail="Supabase credentials not configured.")
+        if not supabase_url or not supabase_key:
+            raise HTTPException(status_code=500, detail="Supabase credentials not configured.")
 
-    client = create_client(supabase_url, supabase_key)
-    prefix = prefix or "collections/default/assets"
+        client = create_client(supabase_url, supabase_key)
+        prefix = prefix or "collections/default/assets"
 
-    logger.info("Upload target: Supabase (bucket=%s, prefix=%s)", bucket, prefix)
-    uploaded_files: list[dict[str, str]] = []
-    for output_name, file_bytes in outputs:
-        object_key = str(Path(prefix) / output_name)
-        file_handle = BytesIO(file_bytes)
+        logger.info("Upload target: Supabase (bucket=%s, prefix=%s)", bucket, prefix)
+        uploaded_files: list[dict[str, str]] = []
+        for output_name, file_bytes in outputs:
+            object_key = str(Path(prefix) / output_name)
+            file_handle = BytesIO(file_bytes)
 
-        resp = client.storage.from_(bucket).upload(
-            object_key,
-            file_handle.getvalue(),
-            {
-                "content-type": "application/octet-stream",
-                "upsert": "true",  # must be str, not bool
-            },
-        )
-        logger.info("Supabase upload response: %s", resp)
+            resp = client.storage.from_(bucket).upload(
+                object_key,
+                file_handle.getvalue(),
+                {
+                    "content-type": "application/octet-stream",
+                    "upsert": "true",  # must be str, not bool
+                },
+            )
+            logger.info("Supabase upload response: %s", resp)
 
-        url = client.storage.from_(bucket).get_public_url(object_key)
-        uploaded_files.append({"name": output_name, "path": object_key, "url": url})
-        logger.info("Supabase upload complete: %s -> %s", object_key, url)
+            url = client.storage.from_(bucket).get_public_url(object_key)
+            uploaded_files.append({"name": output_name, "path": object_key, "url": url})
+            logger.info("Supabase upload complete: %s -> %s", object_key, url)
 
-    return {"files": uploaded_files}
+        return {"files": uploaded_files}
+
+    # -------------------------------------------------------------------------
+    # Default: Direct download (return to sender)
+    # -------------------------------------------------------------------------
+    logger.info("Return mode: direct download (storageTarget=%r)", storage_target)
+    boundary = f"sharp-{uuid.uuid4().hex}"
+
+    def iter_parts():
+        for output_name, file_bytes in outputs:
+            header = (
+                f"--{boundary}\r\n"
+                f"Content-Type: application/octet-stream\r\n"
+                f"Content-Disposition: attachment; filename=\"{output_name}\"\r\n"
+                f"Content-Length: {len(file_bytes)}\r\n\r\n"
+            )
+            yield header.encode()
+            yield file_bytes
+            yield b"\r\n"
+        yield f"--{boundary}--\r\n".encode()
+
+    return StreamingResponse(
+        iter_parts(),
+        media_type=f"multipart/mixed; boundary={boundary}",
+    )

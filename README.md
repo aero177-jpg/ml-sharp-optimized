@@ -1,5 +1,3 @@
-# ml-sharp-web-viewer
-
 > **This is a fork of [Apple's ml-sharp](https://github.com/apple/ml-sharp) repository.**
 >
 
