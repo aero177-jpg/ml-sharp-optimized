@@ -27,8 +27,8 @@ cloud = [
 sharp = "sharp.cli:main_cli"
 
 [project.urls]
-Homepage = "https://github.com/apple/ml-sharp"
-Repository = "https://github.com/apple/ml-sharp"
+Homepage = "https://github.com/aero177-jpg/ml-sharp-optimized"
+Repository = "https://github.com/aero177-jpg/ml-sharp-optimized"
 
 [build-system]
 requires = ["setuptools", "setuptools-scm"]
@@ -80,5 +80,3 @@ torch = { index = "pytorch-cu124" }
 torchvision = { index = "pytorch-cu124" }
 torchaudio = { index = "pytorch-cu124" }
 
-[tool.uv]
-pip = ["modal"]

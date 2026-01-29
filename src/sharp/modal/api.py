@@ -1,4 +1,4 @@
-"""Modal FastAPI endpoint for SHARP inference and Supabase upload."""
+"""Modal FastAPI endpoint for SHARP inference and Supabase/R2 upload."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ from typing import Sequence
 import modal
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+
+R2_SIGNATURE_VERSION = "s3v4"
 
 # Updated App Name
 APP_NAME = "ml-sharp-optimized"
@@ -66,6 +68,7 @@ api_image = (
         "fastapi",
         "python-multipart",
         "supabase",
+        "boto3",
     )
     .run_commands("pip install gsplat --no-build-isolation")
     .env({"PYTHONPATH": REMOTE_SRC_PATH, "MODAL_IS_REMOTE": "1"})
@@ -146,15 +149,43 @@ _GPU_DISPATCH = {
 }
 
 
+def _upload_to_r2(*, file_content: bytes, filename: str, config: dict[str, str]) -> str:
+    import mimetypes
+
+    import boto3
+    from botocore.config import Config
+
+    s3 = boto3.client(
+        service_name="s3",
+        endpoint_url=config["s3Endpoint"],
+        aws_access_key_id=config["s3AccessKeyId"],
+        aws_secret_access_key=config["s3SecretAccessKey"],
+        region_name="auto",
+        config=Config(signature_version=R2_SIGNATURE_VERSION),
+    )
+
+    prefix = config.get("prefix") or ""
+    full_key = f"{prefix}/{filename}".strip("/")
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    s3.put_object(
+        Bucket=config["s3Bucket"],
+        Key=full_key,
+        Body=file_content,
+        ContentType=content_type,
+    )
+
+    return f"https://{config['s3Bucket']}.r2.cloudflarestorage.com/{full_key}"
+
+
 @app.function(
     # run endpoint on CPU; GPU is selected in worker
     **_WORKER_KWARGS,
 )
 @modal.fastapi_endpoint(method="POST")
 async def process_image(request: Request):
-    """Run SHARP on an uploaded image, upload outputs to Supabase, and return URLs."""
+    """Run SHARP on an uploaded image, upload outputs to Supabase/R2, and return URLs."""
     from sharp.modal.app import _predict_batch_impl
-    from supabase import create_client
 
     api_key = os.environ.get(API_KEY_ENV)
     if api_key:
@@ -213,15 +244,44 @@ async def process_image(request: Request):
             media_type=f"multipart/mixed; boundary={boundary}",
         )
 
+    s3_endpoint = form.get("s3Endpoint")
+    s3_access_key_id = form.get("s3AccessKeyId")
+    s3_secret_access_key = form.get("s3SecretAccessKey")
+    s3_bucket = form.get("s3Bucket")
+    prefix = form.get("prefix") or ""
+
+    if s3_endpoint and s3_access_key_id and s3_secret_access_key and s3_bucket:
+        uploaded_files: list[dict[str, str]] = []
+        r2_config = {
+            "s3Endpoint": s3_endpoint,
+            "s3AccessKeyId": s3_access_key_id,
+            "s3SecretAccessKey": s3_secret_access_key,
+            "s3Bucket": s3_bucket,
+            "prefix": prefix,
+        }
+
+        for output_name, file_bytes in outputs:
+            url = _upload_to_r2(
+                file_content=file_bytes,
+                filename=output_name,
+                config=r2_config,
+            )
+            object_key = f"{prefix}/{output_name}".strip("/")
+            uploaded_files.append({"name": output_name, "path": object_key, "url": url})
+
+        return {"files": uploaded_files}
+
     supabase_url = os.environ.get(SUPABASE_URL_ENV)
     supabase_key = os.environ.get(SUPABASE_KEY_ENV)
     bucket = os.environ.get(SUPABASE_BUCKET_ENV, DEFAULT_BUCKET)
+
+    from supabase import create_client
 
     if not supabase_url or not supabase_key:
         raise HTTPException(status_code=500, detail="Supabase credentials not configured.")
 
     client = create_client(supabase_url, supabase_key)
-    prefix = form.get("prefix") or "collections/default/assets"
+    prefix = prefix or "collections/default/assets"
 
     uploaded_files: list[dict[str, str]] = []
     for output_name, file_bytes in outputs:
