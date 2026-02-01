@@ -20,19 +20,15 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 # Updated App Name
-APP_NAME = "ml-sharp-optimizedv2"
+APP_NAME = "ml-sharp-optimized"
 
 # Secret names expected to be provisioned in Modal
-SUPABASE_SECRET_NAME = "supabase-creds"
 API_AUTH_SECRET_NAME = "sharp-api-auth"
 
 API_KEY_HEADER = "X-API-KEY"
 API_KEY_ENV = "API_AUTH_TOKEN"
-SUPABASE_URL_ENV = "SUPABASE_URL"
-SUPABASE_KEY_ENV = "SUPABASE_KEY"
-SUPABASE_BUCKET_ENV = "SUPABASE_BUCKET"
 
-DEFAULT_BUCKET = "testbucket"
+DEFAULT_BUCKET = "3dgs-assets"
 DEFAULT_EXPORT_FORMATS: Sequence[str] = ("sog",)
 
 # Local repo path (resolved at deploy time on your machine, not in container)
@@ -103,10 +99,49 @@ _WORKER_KWARGS = dict(
     timeout=TIMEOUT_SECONDS,
     image=api_image,
     secrets=[
-        modal.Secret.from_name(SUPABASE_SECRET_NAME),
         modal.Secret.from_name(API_AUTH_SECRET_NAME),
     ],
 )
+
+
+def _parse_access_string(access_string: str) -> dict[str, str]:
+    """Parse an access string into a dict.
+
+    Supports JSON objects or key=value pairs delimited by ';', ',' or newlines.
+    Example: "supabaseUrl=...;supabaseKey=...;supabaseBucket=..."
+    """
+    import json
+
+    if not access_string or not access_string.strip():
+        return {}
+
+    raw = access_string.strip()
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except json.JSONDecodeError:
+            pass
+
+    parts: list[str] = []
+    for sep in (";", ",", "\n"):
+        if sep in raw:
+            parts = [p for p in raw.replace("\r", "").split(sep) if p.strip()]
+            break
+    if not parts:
+        parts = [raw]
+
+    parsed: dict[str, str] = {}
+    for part in parts:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            parsed[key] = value
+    return parsed
 
 
 def _run_batch_impl(
@@ -268,15 +303,18 @@ async def process_image(request: Request):
     prefix = form.get("prefix") or ""
     logger.info("Received storageTarget=%r, prefix=%r", storage_target, prefix)
 
+    access_string = form.get("accessString") or form.get("access") or ""
+    access = _parse_access_string(access_string)
+
     # -------------------------------------------------------------------------
     # R2 Upload
     # -------------------------------------------------------------------------
     if storage_target == "r2":
-        s3_endpoint = form.get("s3Endpoint")
-        s3_access_key_id = form.get("s3AccessKeyId")
-        s3_secret_access_key = form.get("s3SecretAccessKey")
-        s3_bucket = form.get("s3Bucket")
-        s3_public_url_base = form.get("s3PublicUrlBase")  # optional custom domain
+        s3_endpoint = access.get("s3Endpoint")
+        s3_access_key_id = access.get("s3AccessKeyId")
+        s3_secret_access_key = access.get("s3SecretAccessKey")
+        s3_bucket = access.get("s3Bucket")
+        s3_public_url_base = access.get("s3PublicUrlBase")  # optional custom domain
 
         missing = []
         if not s3_endpoint:
@@ -332,14 +370,14 @@ async def process_image(request: Request):
     # Supabase Upload
     # -------------------------------------------------------------------------
     if storage_target == "supabase":
-        supabase_url = os.environ.get(SUPABASE_URL_ENV)
-        supabase_key = os.environ.get(SUPABASE_KEY_ENV)
-        bucket = os.environ.get(SUPABASE_BUCKET_ENV, DEFAULT_BUCKET)
+        supabase_url = access.get("supabaseUrl") or access.get("SUPABASE_URL")
+        supabase_key = access.get("supabaseKey") or access.get("SUPABASE_KEY")
+        bucket = access.get("supabaseBucket") or access.get("SUPABASE_BUCKET") or DEFAULT_BUCKET
 
         from supabase import create_client
 
         if not supabase_url or not supabase_key:
-            raise HTTPException(status_code=500, detail="Supabase credentials not configured.")
+            raise HTTPException(status_code=400, detail="Supabase accessString missing supabaseUrl/supabaseKey.")
 
         client = create_client(supabase_url, supabase_key)
         prefix = prefix or "collections/default/assets"
