@@ -67,7 +67,12 @@ def write_progress(job_id: str, data: dict[str, Any], *, commit: bool = True) ->
 
 
 def read_progress(job_id: str) -> dict[str, Any] | None:
-    """Read the progress snapshot for a job."""
+    """Read the progress snapshot for a job.
+
+    Reloads the volume first so we see the latest writes from other containers.
+    """
+    progress_volume.reload()
+
     path = _job_path(job_id)
     if not path.exists():
         return None
