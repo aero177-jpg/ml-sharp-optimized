@@ -33,10 +33,12 @@ TIMEOUT_SECONDS = 1200
 # GPU type mapping
 GpuTier = Literal["t4", "l4", "a10", "a100", "h100"]
 
-# Create Modal app and volume
+# Create Modal app and volumes
 app = modal.App(name=APP_NAME)
 model_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 modal_image = create_modal_image()
+
+from sharp.modal.progress import PROGRESS_VOLUME_PATH, progress_volume, write_progress
 
 
 def _load_image_from_bytes(image_bytes: bytes, filename: str) -> tuple[np.ndarray, float]:
@@ -241,77 +243,83 @@ def _serialize_ply_to_bytes(
 # GPU-specific function variants
 @app.function(
     gpu="t4",
-    volumes={MODEL_CACHE_PATH: model_volume},
+    volumes={MODEL_CACHE_PATH: model_volume, PROGRESS_VOLUME_PATH: progress_volume},
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
 def predict_gaussian_splat_t4(
     image_batch: list[tuple[bytes, str]],
     export_formats: tuple[str, ...] = ("ply",),
+    job_id: str | None = None,
 ) -> list[tuple[str, bytes]]:
     """Run inference on T4 GPU ($0.59/hr, budget option)."""
-    return _predict_batch_impl(image_batch, export_formats)
+    return _predict_batch_impl(image_batch, export_formats, job_id=job_id)
 
 
 @app.function(
     gpu="l4",
-    volumes={MODEL_CACHE_PATH: model_volume},
+    volumes={MODEL_CACHE_PATH: model_volume, PROGRESS_VOLUME_PATH: progress_volume},
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
 def predict_gaussian_splat_l4(
     image_batch: list[tuple[bytes, str]],
     export_formats: tuple[str, ...] = ("ply",),
+    job_id: str | None = None,
 ) -> list[tuple[str, bytes]]:
     """Run inference on L4 GPU ($0.80/hr)."""
-    return _predict_batch_impl(image_batch, export_formats)
+    return _predict_batch_impl(image_batch, export_formats, job_id=job_id)
 
 
 @app.function(
     gpu="a10",
-    volumes={MODEL_CACHE_PATH: model_volume},
+    volumes={MODEL_CACHE_PATH: model_volume, PROGRESS_VOLUME_PATH: progress_volume},
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
 def predict_gaussian_splat_a10(
     image_batch: list[tuple[bytes, str]],
     export_formats: tuple[str, ...] = ("ply",),
+    job_id: str | None = None,
 ) -> list[tuple[str, bytes]]:
     """Run inference on A10 GPU ($1.10/hr, default)."""
-    return _predict_batch_impl(image_batch, export_formats)
+    return _predict_batch_impl(image_batch, export_formats, job_id=job_id)
 
 
 @app.function(
     gpu="a100",
-    volumes={MODEL_CACHE_PATH: model_volume},
+    volumes={MODEL_CACHE_PATH: model_volume, PROGRESS_VOLUME_PATH: progress_volume},
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
 def predict_gaussian_splat_a100(
     image_batch: list[tuple[bytes, str]],
     export_formats: tuple[str, ...] = ("ply",),
+    job_id: str | None = None,
 ) -> list[tuple[str, bytes]]:
     """Run inference on A100 GPU ($2.50/hr)."""
-    return _predict_batch_impl(image_batch, export_formats)
+    return _predict_batch_impl(image_batch, export_formats, job_id=job_id)
 
 
 @app.function(
     gpu="h100",
-    volumes={MODEL_CACHE_PATH: model_volume},
+    volumes={MODEL_CACHE_PATH: model_volume, PROGRESS_VOLUME_PATH: progress_volume},
     timeout=TIMEOUT_SECONDS,
     image=modal_image,
 )
 def predict_gaussian_splat_h100(
     image_batch: list[tuple[bytes, str]],
     export_formats: tuple[str, ...] = ("ply",),
+    job_id: str | None = None,
 ) -> list[tuple[str, bytes]]:
     """Run inference on H100 GPU ($3.95/hr, fastest)."""
-    return _predict_batch_impl(image_batch, export_formats)
+    return _predict_batch_impl(image_batch, export_formats, job_id=job_id)
 
 
 def _predict_batch_impl(
     image_batch: list[tuple[bytes, str]],
     export_formats: tuple[str, ...],
+    job_id: str | None = None,
 ) -> list[tuple[str, bytes]]:
     """Shared implementation for all GPU variants.
 
@@ -349,6 +357,19 @@ def _predict_batch_impl(
         LOGGER.info("CUDA device summary: %s", device_summary)
         LOGGER.info("CUDA runtime version: %s", torch.version.cuda)
 
+    total_steps = len(image_batch)
+    if job_id:
+        write_progress(
+            job_id,
+            {
+                "status": "running",
+                "step": 0,
+                "total_steps": total_steps,
+                "message": "Starting inference",
+                "done": False,
+            },
+        )
+
     # Load or download model
     model_path = Path(MODEL_CACHE_PATH) / "sharp_model.pt"
 
@@ -382,6 +403,18 @@ def _predict_batch_impl(
     gaussian_predictor.eval()
     gaussian_predictor.to(device)
 
+    if job_id:
+        write_progress(
+            job_id,
+            {
+                "status": "running",
+                "step": 0,
+                "total_steps": total_steps,
+                "message": "Model ready",
+                "done": False,
+            },
+        )
+
     export_formats_normalized = tuple(
         dict.fromkeys(fmt.lower() for fmt in export_formats)
     ) or ("ply",)
@@ -389,80 +422,123 @@ def _predict_batch_impl(
     outputs: list[tuple[str, bytes]] = []
     internal_shape = (1536, 1536)
 
-    for image_bytes, filename in image_batch:
-        LOGGER.info("Processing %s on Modal GPU", filename)
+    total_images = len(image_batch)
+    LOGGER.info("Processing batch: %d image(s)", total_images)
 
-        # Load image from bytes
-        image, f_px = _load_image_from_bytes(image_bytes, filename)
-        height, width = image.shape[:2]
-
-        image_pt = (
-            torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
-        )
-        disparity_factor = torch.tensor([f_px / width]).float().to(device)
-
-        image_resized_pt = F.interpolate(
-            image_pt[None],
-            size=(internal_shape[1], internal_shape[0]),
-            mode="bilinear",
-            align_corners=True,
-        )
-
-        LOGGER.info("Running inference")
-        with torch.no_grad():
-            gaussians_ndc = gaussian_predictor(image_resized_pt, disparity_factor)
-
-        intrinsics = (
-            torch.tensor(
-                [
-                    [f_px, 0, width / 2, 0],
-                    [0, f_px, height / 2, 0],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1],
-                ]
-            )
-            .float()
-            .to(device)
-        )
-
-        intrinsics_resized = intrinsics.clone()
-        intrinsics_resized[0] *= internal_shape[0] / width
-        intrinsics_resized[1] *= internal_shape[1] / height
-
-        gaussians = unproject_gaussians(
-            gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
-        )
-
-        def _serialize_output(fmt: str) -> tuple[str, bytes]:
-            fmt_lower = fmt.lower()
-            output_stem = Path(filename).stem
-            if fmt_lower == "ply":
-                LOGGER.info("Serializing to PLY")
-                return (
-                    f"{output_stem}.ply",
-                    _serialize_ply_to_bytes(gaussians, f_px, (height, width)),
+    try:
+        for index, (image_bytes, filename) in enumerate(image_batch, start=1):
+            LOGGER.info("Processing %s (%d/%d)", filename, index, total_images)
+            if job_id:
+                write_progress(
+                    job_id,
+                    {
+                        "status": "running",
+                        "step": index,
+                        "total_steps": total_steps,
+                        "message": f"Processing {filename} ({index}/{total_images})",
+                        "done": False,
+                    },
                 )
 
-            if fmt_lower not in {"splat", "sog"}:
-                raise ValueError(f"Unsupported export format: {fmt}")
+            # Load image from bytes
+            image, f_px = _load_image_from_bytes(image_bytes, filename)
+            height, width = image.shape[:2]
 
-            import tempfile
+            # Convert to tensor
+            image_pt = (
+                torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
+            )
+            disparity_factor = torch.tensor([f_px / width]).float().to(device)
 
-            output_filename = f"{output_stem}.{fmt_lower}"
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                output_path = Path(tmp_dir) / output_filename
-                if fmt_lower == "splat":
-                    LOGGER.info("Serializing to SPLAT")
-                    save_splat(gaussians, f_px, (height, width), output_path)
-                else:
-                    LOGGER.info("Serializing to SOG")
-                    save_sog(gaussians, f_px, (height, width), output_path)
-                return output_filename, output_path.read_bytes()
+            # Resize image
+            image_resized_pt = F.interpolate(
+                image_pt[None],
+                size=(internal_shape[1], internal_shape[0]),
+                mode="bilinear",
+                align_corners=True,
+            )
 
-        outputs.extend(_serialize_output(fmt) for fmt in export_formats_normalized)
-        LOGGER.info("Done processing %s", filename)
+            LOGGER.info("Running inference")
+            with torch.no_grad():
+                gaussians_ndc = gaussian_predictor(image_resized_pt, disparity_factor)
 
-    return outputs
+            intrinsics = (
+                torch.tensor(
+                    [
+                        [f_px, 0, width / 2, 0],
+                        [0, f_px, height / 2, 0],
+                        [0, 0, 1, 0],
+                        [0, 0, 0, 1],
+                    ]
+                )
+                .float()
+                .to(device)
+            )
+
+            intrinsics_resized = intrinsics.clone()
+            intrinsics_resized[0] *= internal_shape[0] / width
+            intrinsics_resized[1] *= internal_shape[1] / height
+
+            gaussians = unproject_gaussians(
+                gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
+            )
+
+            def _serialize_output(fmt: str) -> tuple[str, bytes]:
+                fmt_lower = fmt.lower()
+                output_stem = Path(filename).stem
+                if fmt_lower == "ply":
+                    LOGGER.info("Serializing to PLY")
+                    return (
+                        f"{output_stem}.ply",
+                        _serialize_ply_to_bytes(gaussians, f_px, (height, width)),
+                    )
+
+                if fmt_lower not in {"splat", "sog"}:
+                    raise ValueError(f"Unsupported export format: {fmt}")
+
+                import tempfile
+
+                output_filename = f"{output_stem}.{fmt_lower}"
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    output_path = Path(tmp_dir) / output_filename
+                    if fmt_lower == "splat":
+                        LOGGER.info("Serializing to SPLAT")
+                        save_splat(gaussians, f_px, (height, width), output_path)
+                    else:
+                        LOGGER.info("Serializing to SOG")
+                        save_sog(gaussians, f_px, (height, width), output_path)
+                    return output_filename, output_path.read_bytes()
+
+            outputs.extend(_serialize_output(fmt) for fmt in export_formats_normalized)
+            LOGGER.info("Done processing %s", filename)
+
+        if job_id:
+            write_progress(
+                job_id,
+                {
+                    "status": "complete",
+                    "step": total_steps,
+                    "total_steps": total_steps,
+                    "message": "Done",
+                    "done": True,
+                },
+            )
+
+        return outputs
+    except Exception as e:
+        if job_id:
+            write_progress(
+                job_id,
+                {
+                    "status": "failed",
+                    "step": 0,
+                    "total_steps": total_steps,
+                    "message": f"Failed: {e}",
+                    "done": True,
+                    "error": str(e),
+                },
+            )
+        raise
 
 
 def get_predict_function(gpu_tier: GpuTier = "a10"):

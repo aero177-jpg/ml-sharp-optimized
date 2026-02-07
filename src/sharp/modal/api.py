@@ -90,12 +90,13 @@ api_image = (
 
 # Import volume/constants from app.py at deploy time (runs locally)
 from sharp.modal.app import MODEL_CACHE_PATH, TIMEOUT_SECONDS, model_volume
+from sharp.modal.progress import PROGRESS_VOLUME_PATH, progress_volume, read_progress, write_progress
 
 # Separate Modal app for the HTTP endpoint
 app = modal.App(name=APP_NAME)
 
 _WORKER_KWARGS = dict(
-    volumes={MODEL_CACHE_PATH: model_volume},
+    volumes={MODEL_CACHE_PATH: model_volume, PROGRESS_VOLUME_PATH: progress_volume},
     timeout=TIMEOUT_SECONDS,
     image=api_image,
     secrets=[
@@ -145,39 +146,60 @@ def _parse_access_string(access_string: str) -> dict[str, str]:
 
 
 def _run_batch_impl(
-    image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]
+    image_batch: list[tuple[bytes, str]], export_formats: Sequence[str], job_id: str | None
 ) -> list[tuple[str, bytes]]:
     from sharp.modal.app import _predict_batch_impl
 
     return _predict_batch_impl(
         image_batch=image_batch,
         export_formats=tuple(export_formats),
+        job_id=job_id,
     )
 
 
 @app.function(gpu="a10", **_WORKER_KWARGS)
-def _predict_on_a10(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
-    return _run_batch_impl(image_batch, export_formats)
+def _predict_on_a10(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: Sequence[str],
+    job_id: str | None = None,
+):
+    return _run_batch_impl(image_batch, export_formats, job_id)
 
 
 @app.function(gpu="t4", **_WORKER_KWARGS)
-def _predict_on_t4(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
-    return _run_batch_impl(image_batch, export_formats)
+def _predict_on_t4(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: Sequence[str],
+    job_id: str | None = None,
+):
+    return _run_batch_impl(image_batch, export_formats, job_id)
 
 
 @app.function(gpu="l4", **_WORKER_KWARGS)
-def _predict_on_l4(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
-    return _run_batch_impl(image_batch, export_formats)
+def _predict_on_l4(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: Sequence[str],
+    job_id: str | None = None,
+):
+    return _run_batch_impl(image_batch, export_formats, job_id)
 
 
 @app.function(gpu="a100", **_WORKER_KWARGS)
-def _predict_on_a100(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
-    return _run_batch_impl(image_batch, export_formats)
+def _predict_on_a100(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: Sequence[str],
+    job_id: str | None = None,
+):
+    return _run_batch_impl(image_batch, export_formats, job_id)
 
 
 @app.function(gpu="h100", **_WORKER_KWARGS)
-def _predict_on_h100(image_batch: list[tuple[bytes, str]], export_formats: Sequence[str]):
-    return _run_batch_impl(image_batch, export_formats)
+def _predict_on_h100(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: Sequence[str],
+    job_id: str | None = None,
+):
+    return _run_batch_impl(image_batch, export_formats, job_id)
 
 
 _GPU_DISPATCH = {
@@ -277,6 +299,23 @@ async def process_image(request: Request):
         image_bytes = await upload.read()
         image_batch.append((image_bytes, filename))
 
+    job_id = (
+        form.get("jobId")
+        or form.get("job_id")
+        or f"job-{uuid.uuid4().hex}"
+    )
+    total_steps = len(image_batch)
+    write_progress(
+        job_id,
+        {
+            "status": "queued",
+            "step": 0,
+            "total_steps": total_steps,
+            "message": "Queued",
+            "done": False,
+        },
+    )
+
     formats_raw = form.get("format") or form.get("formats")
     export_formats: Sequence[str]
     if isinstance(formats_raw, str) and formats_raw.strip():
@@ -285,18 +324,34 @@ async def process_image(request: Request):
         export_formats = DEFAULT_EXPORT_FORMATS
 
     gpu_request = (form.get("gpu") or form.get("gpu_type") or "a10").strip().lower()
-    if gpu_request in _GPU_DISPATCH:
-        outputs = await _GPU_DISPATCH[gpu_request].remote.aio(
-            image_batch=image_batch,
-            export_formats=export_formats,
+    try:
+        if gpu_request in _GPU_DISPATCH:
+            outputs = await _GPU_DISPATCH[gpu_request].remote.aio(
+                image_batch=image_batch,
+                export_formats=export_formats,
+                job_id=job_id,
+            )
+        elif gpu_request in {"cpu", "none"}:
+            outputs = _predict_batch_impl(
+                image_batch=image_batch,
+                export_formats=tuple(export_formats),
+                job_id=job_id,
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported gpu: {gpu_request}")
+    except Exception as e:
+        write_progress(
+            job_id,
+            {
+                "status": "failed",
+                "step": 0,
+                "total_steps": total_steps,
+                "message": f"Failed: {e}",
+                "done": True,
+                "error": str(e),
+            },
         )
-    elif gpu_request in {"cpu", "none"}:
-        outputs = _predict_batch_impl(
-            image_batch=image_batch,
-            export_formats=tuple(export_formats),
-        )
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported gpu: {gpu_request}")
+        raise
 
     # Explicit storage target: "r2" | "supabase" | anything else -> direct download
     storage_target = (form.get("storageTarget") or "").strip().lower()
@@ -364,7 +419,17 @@ async def process_image(request: Request):
                 logger.exception("R2 upload failed for %s", output_name)
                 raise HTTPException(status_code=500, detail=f"R2 upload failed: {e}")
 
-        return {"files": uploaded_files}
+        write_progress(
+            job_id,
+            {
+                "status": "complete",
+                "step": total_steps,
+                "total_steps": total_steps,
+                "message": "Done",
+                "done": True,
+            },
+        )
+        return {"job_id": job_id, "files": uploaded_files}
 
     # -------------------------------------------------------------------------
     # Supabase Upload
@@ -402,7 +467,17 @@ async def process_image(request: Request):
             uploaded_files.append({"name": output_name, "path": object_key, "url": url})
             logger.info("Supabase upload complete: %s -> %s", object_key, url)
 
-        return {"files": uploaded_files}
+        write_progress(
+            job_id,
+            {
+                "status": "complete",
+                "step": total_steps,
+                "total_steps": total_steps,
+                "message": "Done",
+                "done": True,
+            },
+        )
+        return {"job_id": job_id, "files": uploaded_files}
 
     # -------------------------------------------------------------------------
     # Default: Direct download (return to sender)
@@ -423,7 +498,32 @@ async def process_image(request: Request):
             yield b"\r\n"
         yield f"--{boundary}--\r\n".encode()
 
-    return StreamingResponse(
+    write_progress(
+        job_id,
+        {
+            "status": "complete",
+            "step": total_steps,
+            "total_steps": total_steps,
+            "message": "Done",
+            "done": True,
+        },
+    )
+
+    response = StreamingResponse(
         iter_parts(),
         media_type=f"multipart/mixed; boundary={boundary}",
     )
+    response.headers["X-Job-Id"] = job_id
+    return response
+
+
+@app.function(
+    **_WORKER_KWARGS,
+)
+@modal.fastapi_endpoint(method="GET")
+def get_progress(job_id: str):
+    """Return the latest progress snapshot for a job."""
+    progress = read_progress(job_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return progress
