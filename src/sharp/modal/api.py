@@ -323,7 +323,74 @@ async def process_image(request: Request):
     else:
         export_formats = DEFAULT_EXPORT_FORMATS
 
+    # Explicit storage target: "r2" | "supabase" | anything else -> direct download
+    storage_target = (form.get("storageTarget") or "").strip().lower()
+    prefix = form.get("prefix") or ""
+    logger.info("Received storageTarget=%r, prefix=%r", storage_target, prefix)
+
+    access_string = form.get("accessString") or form.get("access") or ""
+    access = _parse_access_string(access_string)
+
+    # Pre-validate storage requirements before GPU work
+    if storage_target == "r2":
+        required = ("s3Endpoint", "s3AccessKeyId", "s3SecretAccessKey", "s3Bucket")
+        missing = [key for key in required if not access.get(key)]
+        if missing:
+            logger.warning("R2 selected but missing fields: %s", missing)
+            write_progress(
+                job_id,
+                {
+                    "status": "failed",
+                    "step": 0,
+                    "total_steps": total_steps,
+                    "message": f"Missing fields: {', '.join(missing)}",
+                    "done": True,
+                    "error": f"storageTarget=r2 requires: {', '.join(missing)}",
+                },
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"storageTarget=r2 requires: {', '.join(missing)}",
+            )
+    elif storage_target == "supabase":
+        missing = []
+        if not (access.get("supabaseUrl") or access.get("SUPABASE_URL")):
+            missing.append("supabaseUrl")
+        if not (access.get("supabaseKey") or access.get("SUPABASE_KEY")):
+            missing.append("supabaseKey")
+        if missing:
+            logger.warning("Supabase selected but missing fields: %s", missing)
+            write_progress(
+                job_id,
+                {
+                    "status": "failed",
+                    "step": 0,
+                    "total_steps": total_steps,
+                    "message": f"Missing fields: {', '.join(missing)}",
+                    "done": True,
+                    "error": f"storageTarget=supabase requires: {', '.join(missing)}",
+                },
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"storageTarget=supabase requires: {', '.join(missing)}",
+            )
+
     gpu_request = (form.get("gpu") or form.get("gpu_type") or "a10").strip().lower()
+    if gpu_request not in _GPU_DISPATCH and gpu_request not in {"cpu", "none"}:
+        write_progress(
+            job_id,
+            {
+                "status": "failed",
+                "step": 0,
+                "total_steps": total_steps,
+                "message": f"Unsupported gpu: {gpu_request}",
+                "done": True,
+                "error": f"Unsupported gpu: {gpu_request}",
+            },
+        )
+        raise HTTPException(status_code=400, detail=f"Unsupported gpu: {gpu_request}")
+
     try:
         if gpu_request in _GPU_DISPATCH:
             outputs = await _GPU_DISPATCH[gpu_request].remote.aio(
@@ -331,14 +398,12 @@ async def process_image(request: Request):
                 export_formats=export_formats,
                 job_id=job_id,
             )
-        elif gpu_request in {"cpu", "none"}:
+        else:
             outputs = _predict_batch_impl(
                 image_batch=image_batch,
                 export_formats=tuple(export_formats),
                 job_id=job_id,
             )
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported gpu: {gpu_request}")
     except Exception as e:
         write_progress(
             job_id,
@@ -352,14 +417,6 @@ async def process_image(request: Request):
             },
         )
         raise
-
-    # Explicit storage target: "r2" | "supabase" | anything else -> direct download
-    storage_target = (form.get("storageTarget") or "").strip().lower()
-    prefix = form.get("prefix") or ""
-    logger.info("Received storageTarget=%r, prefix=%r", storage_target, prefix)
-
-    access_string = form.get("accessString") or form.get("access") or ""
-    access = _parse_access_string(access_string)
 
     # -------------------------------------------------------------------------
     # R2 Upload
