@@ -66,6 +66,31 @@ def write_progress(job_id: str, data: dict[str, Any], *, commit: bool = True) ->
     return snapshot
 
 
+def write_status(
+    job_id: str,
+    *,
+    status: str,
+    phase: str | None = None,
+    message: str | None = None,
+    step: int | float | None = None,
+    total_steps: int | float | None = None,
+    commit: bool = True,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Write a normalized status payload for frontend polling."""
+    payload: dict[str, Any] = {"status": status}
+    if phase is not None:
+        payload["phase"] = phase
+    if message is not None:
+        payload["message"] = message
+    if step is not None:
+        payload["step"] = step
+    if total_steps is not None:
+        payload["total_steps"] = total_steps
+    payload.update(extra)
+    return write_progress(job_id, payload, commit=commit)
+
+
 def read_progress(job_id: str) -> dict[str, Any] | None:
     """Read the progress snapshot for a job.
 

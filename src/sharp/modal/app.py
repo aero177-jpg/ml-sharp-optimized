@@ -38,7 +38,7 @@ app = modal.App(name=APP_NAME)
 model_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 modal_image = create_modal_image()
 
-from sharp.modal.progress import PROGRESS_VOLUME_PATH, progress_volume, write_progress
+from sharp.modal.progress import PROGRESS_VOLUME_PATH, progress_volume, write_status
 
 
 def _load_image_from_bytes(image_bytes: bytes, filename: str) -> tuple[np.ndarray, float]:
@@ -359,15 +359,14 @@ def _predict_batch_impl(
 
     total_steps = len(image_batch)
     if job_id:
-        write_progress(
+        write_status(
             job_id,
-            {
-                "status": "running",
-                "step": 0,
-                "total_steps": total_steps,
-                "message": "Starting inference",
-                "done": False,
-            },
+            status="running",
+            phase="preparing_gpu",
+            step=0,
+            total_steps=total_steps,
+            message="Preparing GPU runtime",
+            done=False,
         )
 
     # Load or download model
@@ -375,6 +374,16 @@ def _predict_batch_impl(
 
     def download_model() -> dict:
         """Download model from URL and cache to volume."""
+        if job_id:
+            write_status(
+                job_id,
+                status="running",
+                phase="downloading_model",
+                step=0,
+                total_steps=total_steps,
+                message="Downloading model checkpoint",
+                done=False,
+            )
         LOGGER.info(f"Downloading model from {DEFAULT_MODEL_URL}")
         state = torch.hub.load_state_dict_from_url(
             DEFAULT_MODEL_URL, progress=True, map_location=device
@@ -385,8 +394,29 @@ def _predict_batch_impl(
         LOGGER.info("Model cached to volume")
         return state
 
+    if job_id:
+        write_status(
+            job_id,
+            status="running",
+            phase="checking_model_cache",
+            step=0,
+            total_steps=total_steps,
+            message="Checking model cache",
+            done=False,
+        )
+
     if model_path.exists():
         LOGGER.info("Loading cached model from volume")
+        if job_id:
+            write_status(
+                job_id,
+                status="running",
+                phase="loading_model",
+                step=0,
+                total_steps=total_steps,
+                message="Loading cached model",
+                done=False,
+            )
         try:
             state_dict = torch.load(model_path, weights_only=True, map_location=device)
         except Exception as e:
@@ -404,15 +434,14 @@ def _predict_batch_impl(
     gaussian_predictor.to(device)
 
     if job_id:
-        write_progress(
+        write_status(
             job_id,
-            {
-                "status": "running",
-                "step": 0,
-                "total_steps": total_steps,
-                "message": "Model ready",
-                "done": False,
-            },
+            status="running",
+            phase="model_ready",
+            step=0,
+            total_steps=total_steps,
+            message="Model loaded and ready",
+            done=False,
         )
 
     export_formats_normalized = tuple(
@@ -429,15 +458,14 @@ def _predict_batch_impl(
         for index, (image_bytes, filename) in enumerate(image_batch, start=1):
             LOGGER.info("Processing %s (%d/%d)", filename, index, total_images)
             if job_id:
-                write_progress(
+                write_status(
                     job_id,
-                    {
-                        "status": "running",
-                        "step": index,
-                        "total_steps": total_steps,
-                        "message": f"Processing {filename} ({index}/{total_images})",
-                        "done": False,
-                    },
+                    status="running",
+                    phase="processing_images",
+                    step=index,
+                    total_steps=total_steps,
+                    message=f"Processing {filename} ({index}/{total_images})",
+                    done=False,
                 )
 
             # Load image from bytes
@@ -486,6 +514,16 @@ def _predict_batch_impl(
             def _serialize_output(fmt: str) -> tuple[str, bytes]:
                 fmt_lower = fmt.lower()
                 output_stem = Path(filename).stem
+                if job_id:
+                    write_status(
+                        job_id,
+                        status="running",
+                        phase="serializing_outputs",
+                        step=index,
+                        total_steps=total_steps,
+                        message=f"Serializing {output_stem}.{fmt_lower}",
+                        done=False,
+                    )
                 if fmt_lower == "ply":
                     LOGGER.info("Serializing to PLY")
                     return (
@@ -513,30 +551,28 @@ def _predict_batch_impl(
             LOGGER.info("Done processing %s", filename)
 
         if job_id:
-            write_progress(
+            write_status(
                 job_id,
-                {
-                    "status": "complete",
-                    "step": total_steps,
-                    "total_steps": total_steps,
-                    "message": "Done",
-                    "done": True,
-                },
+                status="complete",
+                phase="completed",
+                step=total_steps,
+                total_steps=total_steps,
+                message="Inference complete",
+                done=True,
             )
 
         return outputs
     except Exception as e:
         if job_id:
-            write_progress(
+            write_status(
                 job_id,
-                {
-                    "status": "failed",
-                    "step": 0,
-                    "total_steps": total_steps,
-                    "message": f"Failed: {e}",
-                    "done": True,
-                    "error": str(e),
-                },
+                status="failed",
+                phase="failed",
+                step=0,
+                total_steps=total_steps,
+                message=f"Failed: {e}",
+                done=True,
+                error=str(e),
             )
         raise
 
