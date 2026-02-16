@@ -553,12 +553,12 @@ def _predict_batch_impl(
         if job_id:
             write_status(
                 job_id,
-                status="complete",
-                phase="completed",
+                status="running",
+                phase="inference_complete",
                 step=total_steps,
                 total_steps=total_steps,
-                message="Inference complete",
-                done=True,
+                message="Inference complete, finalizing outputs",
+                done=False,
             )
 
         return outputs

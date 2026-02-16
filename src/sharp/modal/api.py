@@ -238,7 +238,43 @@ def _manifest_path(job_id: str) -> Path:
     return _result_dir(job_id) / "manifest.json"
 
 
-def _save_temp_outputs(job_id: str, outputs: list[tuple[str, bytes]], ttl_seconds: int) -> dict:
+def _endpoint_url_from_submit_url(submit_url: str, endpoint_slug: str) -> str:
+    """Build endpoint URL for Modal unique endpoint hosts.
+
+    Converts:
+      https://<user>--<app>-process-image.modal.run
+    into:
+      https://<user>--<app>-<endpoint_slug>.modal.run
+    """
+    base = submit_url.strip().rstrip("/")
+    needle = "-process-image.modal.run"
+    if base.endswith(needle):
+        return f"{base[:-len(needle)]}-{endpoint_slug}.modal.run"
+    return base
+
+
+def _build_endpoint_urls(request: Request, job_id: str) -> dict[str, str]:
+    submit_base = str(request.base_url).rstrip("/")
+    job_id_q = quote(job_id, safe="")
+
+    status_base = _endpoint_url_from_submit_url(submit_base, "get-progress")
+    results_base = _endpoint_url_from_submit_url(submit_base, "get-results")
+    download_base = _endpoint_url_from_submit_url(submit_base, "download-result")
+
+    return {
+        "submit_url": submit_base,
+        "status_url": f"{status_base}/?job_id={job_id_q}",
+        "results_url": f"{results_base}/?job_id={job_id_q}",
+        "download_base_url": download_base,
+    }
+
+
+def _save_temp_outputs(
+    job_id: str,
+    outputs: list[tuple[str, bytes]],
+    ttl_seconds: int,
+    download_base_url: str,
+) -> dict:
     import json
 
     result_dir = _result_dir(job_id)
@@ -256,7 +292,7 @@ def _save_temp_outputs(job_id: str, outputs: list[tuple[str, bytes]], ttl_second
                 "name": filename,
                 "size": len(file_bytes),
                 "content_type": mimetypes.guess_type(filename)[0] or "application/octet-stream",
-                "download_path": f"/download_result?job_id={job_id_q}&name={filename_q}",
+                "download_url": f"{download_base_url}/?job_id={job_id_q}&name={filename_q}",
             }
         )
 
@@ -341,6 +377,13 @@ def cleanup_expired_results_job() -> dict[str, int]:
     return {"removed": removed}
 
 
+def _authorize_request(request: Request) -> Response | None:
+    api_key = os.environ.get(API_KEY_ENV)
+    if api_key and request.headers.get(API_KEY_HEADER) != api_key:
+        return Response(status_code=401)
+    return None
+
+
 def _upload_to_r2(*, file_content: bytes, filename: str, config: dict[str, str]) -> str:
     """Upload file to Cloudflare R2 using S3-compatible API."""
     import mimetypes
@@ -413,6 +456,8 @@ def _process_job(
     prefix: str,
     gpu_request: str,
     ttl_seconds: int,
+    results_url: str,
+    download_base_url: str,
 ) -> dict:
     """Background job processor for async API flow."""
     from sharp.modal.app import _predict_batch_impl
@@ -563,7 +608,12 @@ def _process_job(
         message="Staging outputs for download",
         done=False,
     )
-    manifest = _save_temp_outputs(job_id=job_id, outputs=outputs, ttl_seconds=ttl_seconds)
+    manifest = _save_temp_outputs(
+        job_id=job_id,
+        outputs=outputs,
+        ttl_seconds=ttl_seconds,
+        download_base_url=download_base_url,
+    )
     files = manifest.get("files", [])
     write_status(
         job_id,
@@ -575,13 +625,15 @@ def _process_job(
         done=True,
         result_type="temp",
         result_files=files,
-        results_path=f"/get_results?job_id={job_id}",
+        results_url=results_url,
+        results_path=results_url,
         expires_at=manifest.get("expires_at"),
     )
     return {
         "job_id": job_id,
         "result_type": "temp",
         "files": files,
+        "results_url": results_url,
         "expires_at": manifest.get("expires_at"),
     }
 
@@ -593,10 +645,9 @@ def _process_job(
 async def process_image(request: Request):
     """Submit SHARP job and return immediately with a pollable job id."""
 
-    api_key = os.environ.get(API_KEY_ENV)
-    if api_key:
-        if request.headers.get(API_KEY_HEADER) != api_key:
-            return Response(status_code=401)
+    unauthorized = _authorize_request(request)
+    if unauthorized:
+        return unauthorized
 
     form = await request.form()
     _cleanup_expired_results()
@@ -619,6 +670,7 @@ async def process_image(request: Request):
         or f"job-{uuid.uuid4().hex}"
     )
     job_id = _sanitize_job_id(str(job_id))
+    endpoint_urls = _build_endpoint_urls(request, job_id)
     total_steps = len(image_batch)
     write_status(
         job_id,
@@ -727,6 +779,8 @@ async def process_image(request: Request):
         prefix=prefix,
         gpu_request=gpu_request,
         ttl_seconds=ttl_seconds,
+        results_url=endpoint_urls["results_url"],
+        download_base_url=endpoint_urls["download_base_url"],
     )
 
     return JSONResponse(
@@ -735,8 +789,11 @@ async def process_image(request: Request):
             "accepted": True,
             "job_id": job_id,
             "status": "queued",
-            "status_path": f"/get_progress?job_id={quote(job_id, safe='')}",
-            "results_path": f"/get_results?job_id={quote(job_id, safe='')}",
+            "submit_url": endpoint_urls["submit_url"],
+            "status_url": endpoint_urls["status_url"],
+            "results_url": endpoint_urls["results_url"],
+            "status_path": endpoint_urls["status_url"],
+            "results_path": endpoint_urls["results_url"],
             "call_id": call.object_id,
         },
     )
@@ -746,8 +803,12 @@ async def process_image(request: Request):
     **_WORKER_KWARGS,
 )
 @modal.fastapi_endpoint(method="GET")
-def get_progress(job_id: str):
+def get_progress(request: Request, job_id: str):
     """Return the latest progress snapshot for a job."""
+    unauthorized = _authorize_request(request)
+    if unauthorized:
+        return unauthorized
+
     _cleanup_expired_results()
     progress = read_progress(job_id)
     if not progress:
@@ -759,8 +820,12 @@ def get_progress(job_id: str):
     **_WORKER_KWARGS,
 )
 @modal.fastapi_endpoint(method="GET")
-def get_results(job_id: str):
+def get_results(request: Request, job_id: str):
     """Get temporary result manifest for a completed job."""
+    unauthorized = _authorize_request(request)
+    if unauthorized:
+        return unauthorized
+
     _cleanup_expired_results()
     manifest = _load_manifest(job_id)
     if not manifest:
@@ -780,12 +845,16 @@ def get_results(job_id: str):
     **_WORKER_KWARGS,
 )
 @modal.fastapi_endpoint(method="GET")
-def download_result(job_id: str, name: str, consume: bool = True):
+def download_result(request: Request, job_id: str, name: str, consume: bool = True):
     """Download one temporary result file.
 
     By default `consume=true`, which deletes the file after it is read.
     """
     import json
+
+    unauthorized = _authorize_request(request)
+    if unauthorized:
+        return unauthorized
 
     _cleanup_expired_results()
     manifest = _load_manifest(job_id)

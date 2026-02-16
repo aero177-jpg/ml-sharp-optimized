@@ -19,9 +19,9 @@ uv run modal token new
 
 2. Go to: 
    `https://modal.com/secrets/<your-username>/main/create?secret_name=sharp-api-auth`
-   and create a key value secret. Remember the value, this will be used in the frontend client.
+  and create a key/value secret with key `API_AUTH_TOKEN`. Remember the value; this is used by the frontend as `X-API-KEY`.
 
-2. Add the following GitHub Actions secrets in your fork:
+3. Add the following GitHub Actions secrets in your fork:
 
 - `MODAL_TOKEN_ID`
 - `MODAL_TOKEN_SECRET`
@@ -82,6 +82,26 @@ uv run sharp cloud predict -i photo.jpg -o output/ --gpu h100  # $3.95/hr (faste
 | A100 | $2.50    | High performance  |
 | H100 | $3.95    | Fastest           |
 
+### Frontend Async Contract (Modal Endpoint URLs)
+
+Modal web endpoints in this app are exposed as unique URLs per function (for example,
+`https://<username>--ml-sharp-optimized-get-progress.modal.run/?job_id=...`), not as path routes under one host.
+
+Frontend clients should:
+
+- Use `status_url`, `results_url`, and per-file `download_url` exactly as returned by `process_image` and `get_results`.
+- Send `X-API-KEY` on all async requests: submit, progress polling, results lookup, and file download.
+- Treat `status_path`/`results_path` as compatibility aliases containing the same full URL values.
+
+`process_image` (`POST`) returns `202` with:
+
+- `job_id`
+- `submit_url`
+- `status_url`
+- `results_url`
+- `call_id`
+
+`get_results` (`GET`) returns temporary result entries containing `download_url` for each file.
 
 
 ## Original README
