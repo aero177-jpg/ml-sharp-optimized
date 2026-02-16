@@ -7,7 +7,9 @@ Deploy the FastAPI endpoint to your own Modal account using GitHub Actions.
 
 ### Prerequisites
 
-1. Create a Modal token in the dashboard by visiting `https://modal.com/settings/<your-username>/tokens`, clicking “Create new”, and copying the token ID and secret from the generated string.
+1. Create a Modal token in the dashboard by visiting 
+`https://modal.com/settings/<your-username>/tokens`
+  clicking “Create new”, and copying the token ID and secret from the generated string.
 
 Alternatively, you can authenticate locally once with:
 
@@ -15,8 +17,9 @@ Alternatively, you can authenticate locally once with:
 uv run modal token new
 ```
 
-2. Go to `sharp-api-auth`:  
-   `https://modal.com/secrets/<your-username>/main/create?secret_name=sharp-api-auth`   and create a key value secret. Remember the value, this will be used in the frontend client.
+2. Go to: 
+   `https://modal.com/secrets/<your-username>/main/create?secret_name=sharp-api-auth`
+   and create a key value secret. Remember the value, this will be used in the frontend client.
 
 2. Add the following GitHub Actions secrets in your fork:
 
