@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 import modal
 from fastapi import HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 R2_SIGNATURE_VERSION = "s3v4"
 
@@ -36,6 +36,7 @@ API_KEY_ENV = "API_AUTH_TOKEN"
 DEFAULT_BUCKET = "3dgs-assets"
 DEFAULT_EXPORT_FORMATS: Sequence[str] = ("sog",)
 DEFAULT_RESULT_TTL_SECONDS = 60 * 60
+HYBRID_DIRECT_MAX_FILES = 9
 
 # Local repo path (resolved at deploy time on your machine, not in container)
 REMOTE_REPO_PATH = "/root/ml-sharp"
@@ -269,6 +270,24 @@ def _build_endpoint_urls(request: Request, job_id: str) -> dict[str, str]:
     }
 
 
+def _content_disposition_attachment(filename: str) -> str:
+    """Build RFC 5987-compatible Content-Disposition value.
+
+    Includes an ASCII fallback (`filename`) and UTF-8 variant (`filename*`)
+    to avoid latin-1 header encoding failures for non-ASCII filenames.
+    """
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii").strip() or "download.bin"
+    ascii_name = (
+        ascii_name.replace("\\", "_")
+        .replace('"', "_")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
+
+    utf8_name = quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"
+
+
 def _save_temp_outputs(
     job_id: str,
     outputs: list[tuple[str, bytes]],
@@ -322,6 +341,29 @@ def _load_manifest(job_id: str) -> dict | None:
     if not isinstance(data, dict):
         return None
     return data
+
+
+def _manifest_is_expired(manifest: dict) -> bool:
+    expires_raw = manifest.get("expires_at")
+    if not isinstance(expires_raw, str):
+        return True
+    try:
+        expires_at = datetime.fromisoformat(expires_raw)
+    except ValueError:
+        return True
+    return expires_at <= _now_utc()
+
+
+def _is_direct_download_candidate(storage_target: str, image_count: int) -> bool:
+    return storage_target not in {"r2", "supabase"} and image_count <= HYBRID_DIRECT_MAX_FILES
+
+
+def _is_truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
 
 
 def _remove_job_results(job_id: str) -> None:
@@ -650,7 +692,6 @@ async def process_image(request: Request):
         return unauthorized
 
     form = await request.form()
-    _cleanup_expired_results()
     uploads = form.getlist("file") or form.getlist("files")
     if not uploads:
         raise HTTPException(
@@ -770,6 +811,80 @@ async def process_image(request: Request):
     except ValueError:
         raise HTTPException(status_code=400, detail="resultTtlSeconds must be an integer")
 
+    force_async = _is_truthy(form.get("forceAsync") or form.get("force_async"))
+
+    if (not force_async) and _is_direct_download_candidate(storage_target, len(image_batch)):
+        from sharp.modal.app import _predict_batch_impl
+
+        write_status(
+            job_id,
+            status="running",
+            phase="dispatching_inference",
+            step=0,
+            total_steps=total_steps,
+            message="Running direct download mode",
+            done=False,
+        )
+        try:
+            if gpu_request in _GPU_DISPATCH:
+                outputs = await _GPU_DISPATCH[gpu_request].remote.aio(
+                    image_batch=image_batch,
+                    export_formats=export_formats,
+                    job_id=job_id,
+                )
+            else:
+                outputs = _predict_batch_impl(
+                    image_batch=image_batch,
+                    export_formats=tuple(export_formats),
+                    job_id=job_id,
+                )
+        except Exception as e:
+            write_status(
+                job_id,
+                status="failed",
+                phase="failed",
+                step=0,
+                total_steps=total_steps,
+                message=f"Failed: {e}",
+                done=True,
+                error=str(e),
+            )
+            raise
+
+        boundary = f"sharp-{uuid.uuid4().hex}"
+
+        def iter_parts():
+            for output_name, file_bytes in outputs:
+                header = (
+                    f"--{boundary}\r\n"
+                    f"Content-Type: application/octet-stream\r\n"
+                    f"Content-Disposition: {_content_disposition_attachment(output_name)}\r\n"
+                    f"Content-Length: {len(file_bytes)}\r\n\r\n"
+                )
+                yield header.encode()
+                yield file_bytes
+                yield b"\r\n"
+            yield f"--{boundary}--\r\n".encode()
+
+        write_status(
+            job_id,
+            status="complete",
+            phase="completed",
+            step=total_steps,
+            total_steps=total_steps,
+            message="Results streamed to client",
+            done=True,
+            result_type="direct",
+        )
+
+        response = StreamingResponse(
+            iter_parts(),
+            media_type=f"multipart/mixed; boundary={boundary}",
+        )
+        response.headers["X-Job-Id"] = job_id
+        response.headers["X-Result-Mode"] = "direct"
+        return response
+
     call = _process_job.spawn(
         image_batch=image_batch,
         export_formats=export_formats,
@@ -809,7 +924,6 @@ def get_progress(request: Request, job_id: str):
     if unauthorized:
         return unauthorized
 
-    _cleanup_expired_results()
     progress = read_progress(job_id)
     if not progress:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -826,10 +940,12 @@ def get_results(request: Request, job_id: str):
     if unauthorized:
         return unauthorized
 
-    _cleanup_expired_results()
     manifest = _load_manifest(job_id)
     if not manifest:
         raise HTTPException(status_code=404, detail="Results not found")
+    if _manifest_is_expired(manifest):
+        _remove_job_results(job_id)
+        raise HTTPException(status_code=404, detail="Results expired")
 
     progress = read_progress(job_id) or {}
     complete = bool(progress.get("done"))
@@ -856,10 +972,12 @@ def download_result(request: Request, job_id: str, name: str, consume: bool = Tr
     if unauthorized:
         return unauthorized
 
-    _cleanup_expired_results()
     manifest = _load_manifest(job_id)
     if not manifest:
         raise HTTPException(status_code=404, detail="Results not found")
+    if _manifest_is_expired(manifest):
+        _remove_job_results(job_id)
+        raise HTTPException(status_code=404, detail="Results expired")
 
     target_name = Path(name).name
     files = manifest.get("files", []) if isinstance(manifest, dict) else []
@@ -898,5 +1016,5 @@ def download_result(request: Request, job_id: str, name: str, consume: bool = Tr
             logger.exception("Failed to consume result file for job_id=%s name=%s", job_id, target_name)
 
     response = Response(content=file_bytes, media_type=media_type)
-    response.headers["Content-Disposition"] = f'attachment; filename="{target_name}"'
+    response.headers["Content-Disposition"] = _content_disposition_attachment(target_name)
     return response
