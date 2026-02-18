@@ -89,7 +89,8 @@ Modal web endpoints in this app are exposed as unique URLs per function (for exa
 
 Frontend clients should:
 
-- Use `status_url`, `results_url`, and per-file `download_url` exactly as returned by `process_image` and `get_results`.
+- Use `status_url` as the canonical polling endpoint; `get_progress` now includes incremental `files` entries as each file becomes available.
+- Use `results_url` as a compatibility manifest endpoint (it mirrors current file availability and completion state).
 - Send `X-API-KEY` on all async requests: submit, progress polling, results lookup, and file download.
 - Treat `status_path`/`results_path` as compatibility aliases containing the same full URL values.
 
@@ -101,7 +102,13 @@ Frontend clients should:
 - `results_url`
 - `call_id`
 
-`get_results` (`GET`) returns temporary result entries containing `download_url` for each file.
+`get_progress` (`GET`) includes incremental fields:
+
+- `files` / `result_files` (available-so-far outputs)
+- `files_ready` / `files_expected`
+- `file_errors` (best-effort per-file failures)
+
+`get_results` (`GET`) returns the same files view for compatibility.
 
 
 ## Original README

@@ -9,7 +9,7 @@ from __future__ import annotations
 import io
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 import modal
 
@@ -320,6 +320,8 @@ def _predict_batch_impl(
     image_batch: list[tuple[bytes, str]],
     export_formats: tuple[str, ...],
     job_id: str | None = None,
+    on_output: Callable[[str, bytes, int, int], None] | None = None,
+    on_error: Callable[[str, str, int, int], None] | None = None,
 ) -> list[tuple[str, bytes]]:
     """Shared implementation for all GPU variants.
 
@@ -454,31 +456,28 @@ def _predict_batch_impl(
     total_images = len(image_batch)
     LOGGER.info("Processing batch: %d image(s)", total_images)
 
-    try:
-        for index, (image_bytes, filename) in enumerate(image_batch, start=1):
-            LOGGER.info("Processing %s (%d/%d)", filename, index, total_images)
-            if job_id:
-                write_status(
-                    job_id,
-                    status="running",
-                    phase="processing_images",
-                    step=index,
-                    total_steps=total_steps,
-                    message=f"Processing {filename} ({index}/{total_images})",
-                    done=False,
-                )
+    for index, (image_bytes, filename) in enumerate(image_batch, start=1):
+        LOGGER.info("Processing %s (%d/%d)", filename, index, total_images)
+        if job_id:
+            write_status(
+                job_id,
+                status="running",
+                phase="processing_images",
+                step=index,
+                total_steps=total_steps,
+                message=f"Processing {filename} ({index}/{total_images})",
+                done=False,
+            )
 
-            # Load image from bytes
+        try:
             image, f_px = _load_image_from_bytes(image_bytes, filename)
             height, width = image.shape[:2]
 
-            # Convert to tensor
             image_pt = (
                 torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
             )
             disparity_factor = torch.tensor([f_px / width]).float().to(device)
 
-            # Resize image
             image_resized_pt = F.interpolate(
                 image_pt[None],
                 size=(internal_shape[1], internal_shape[0]),
@@ -510,71 +509,74 @@ def _predict_batch_impl(
             gaussians = unproject_gaussians(
                 gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
             )
+        except Exception as exc:
+            error_message = f"{filename}: {exc}"
+            LOGGER.exception("Failed processing image %s", filename)
+            if on_error:
+                on_error(filename, error_message, index, total_images)
+            continue
 
-            def _serialize_output(fmt: str) -> tuple[str, bytes]:
-                fmt_lower = fmt.lower()
-                output_stem = Path(filename).stem
-                if job_id:
-                    write_status(
-                        job_id,
-                        status="running",
-                        phase="serializing_outputs",
-                        step=index,
-                        total_steps=total_steps,
-                        message=f"Serializing {output_stem}.{fmt_lower}",
-                        done=False,
-                    )
+        for fmt in export_formats_normalized:
+            fmt_lower = fmt.lower()
+            output_stem = Path(filename).stem
+            if job_id:
+                write_status(
+                    job_id,
+                    status="running",
+                    phase="serializing_outputs",
+                    step=index,
+                    total_steps=total_steps,
+                    message=f"Serializing {output_stem}.{fmt_lower}",
+                    done=False,
+                )
+
+            try:
                 if fmt_lower == "ply":
                     LOGGER.info("Serializing to PLY")
-                    return (
+                    output_name, output_bytes = (
                         f"{output_stem}.ply",
                         _serialize_ply_to_bytes(gaussians, f_px, (height, width)),
                     )
+                else:
+                    if fmt_lower not in {"splat", "sog"}:
+                        raise ValueError(f"Unsupported export format: {fmt}")
 
-                if fmt_lower not in {"splat", "sog"}:
-                    raise ValueError(f"Unsupported export format: {fmt}")
+                    import tempfile
 
-                import tempfile
+                    output_name = f"{output_stem}.{fmt_lower}"
+                    with tempfile.TemporaryDirectory() as tmp_dir:
+                        output_path = Path(tmp_dir) / output_name
+                        if fmt_lower == "splat":
+                            LOGGER.info("Serializing to SPLAT")
+                            save_splat(gaussians, f_px, (height, width), output_path)
+                        else:
+                            LOGGER.info("Serializing to SOG")
+                            save_sog(gaussians, f_px, (height, width), output_path)
+                        output_bytes = output_path.read_bytes()
 
-                output_filename = f"{output_stem}.{fmt_lower}"
-                with tempfile.TemporaryDirectory() as tmp_dir:
-                    output_path = Path(tmp_dir) / output_filename
-                    if fmt_lower == "splat":
-                        LOGGER.info("Serializing to SPLAT")
-                        save_splat(gaussians, f_px, (height, width), output_path)
-                    else:
-                        LOGGER.info("Serializing to SOG")
-                        save_sog(gaussians, f_px, (height, width), output_path)
-                    return output_filename, output_path.read_bytes()
+                outputs.append((output_name, output_bytes))
+                if on_output:
+                    on_output(output_name, output_bytes, index, total_images)
+            except Exception as exc:
+                error_message = f"{output_stem}.{fmt_lower}: {exc}"
+                LOGGER.exception("Failed serializing %s", error_message)
+                if on_error:
+                    on_error(f"{output_stem}.{fmt_lower}", error_message, index, total_images)
 
-            outputs.extend(_serialize_output(fmt) for fmt in export_formats_normalized)
-            LOGGER.info("Done processing %s", filename)
+        LOGGER.info("Done processing %s", filename)
 
-        if job_id:
-            write_status(
-                job_id,
-                status="running",
-                phase="inference_complete",
-                step=total_steps,
-                total_steps=total_steps,
-                message="Inference complete, finalizing outputs",
-                done=False,
-            )
+    if job_id:
+        write_status(
+            job_id,
+            status="running",
+            phase="inference_complete",
+            step=total_steps,
+            total_steps=total_steps,
+            message="Inference complete, finalizing outputs",
+            done=False,
+        )
 
-        return outputs
-    except Exception as e:
-        if job_id:
-            write_status(
-                job_id,
-                status="failed",
-                phase="failed",
-                step=0,
-                total_steps=total_steps,
-                message=f"Failed: {e}",
-                done=True,
-                error=str(e),
-            )
-        raise
+    return outputs
 
 
 def get_predict_function(gpu_tier: GpuTier = "a10"):
