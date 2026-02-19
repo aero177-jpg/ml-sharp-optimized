@@ -360,6 +360,12 @@ def _predict_batch_impl(
         LOGGER.info("CUDA runtime version: %s", torch.version.cuda)
 
     total_steps = len(image_batch)
+
+    # Use commit=False for intermediate status updates during inference
+    # to avoid volume commit contention with the parallel upload worker thread.
+    # The upload worker and critical checkpoints will commit explicitly.
+    _commit = on_output is None  # Only auto-commit if no parallel upload worker
+
     if job_id:
         write_status(
             job_id,
@@ -369,6 +375,7 @@ def _predict_batch_impl(
             total_steps=total_steps,
             message="Preparing GPU runtime",
             done=False,
+            commit=_commit,
         )
 
     # Load or download model
@@ -385,6 +392,7 @@ def _predict_batch_impl(
                 total_steps=total_steps,
                 message="Downloading model checkpoint",
                 done=False,
+                commit=True,  # Important checkpoint: always commit
             )
         LOGGER.info(f"Downloading model from {DEFAULT_MODEL_URL}")
         state = torch.hub.load_state_dict_from_url(
@@ -405,6 +413,7 @@ def _predict_batch_impl(
             total_steps=total_steps,
             message="Checking model cache",
             done=False,
+            commit=_commit,
         )
 
     if model_path.exists():
@@ -418,6 +427,7 @@ def _predict_batch_impl(
                 total_steps=total_steps,
                 message="Loading cached model",
                 done=False,
+                commit=_commit,
             )
         try:
             state_dict = torch.load(model_path, weights_only=True, map_location=device)
@@ -444,6 +454,7 @@ def _predict_batch_impl(
             total_steps=total_steps,
             message="Model loaded and ready",
             done=False,
+            commit=_commit,
         )
 
     export_formats_normalized = tuple(
@@ -467,6 +478,7 @@ def _predict_batch_impl(
                 total_steps=total_steps,
                 message=f"Processing {filename} ({index}/{total_images})",
                 done=False,
+                commit=_commit,
             )
 
         try:
@@ -528,6 +540,7 @@ def _predict_batch_impl(
                     total_steps=total_steps,
                     message=f"Serializing {output_stem}.{fmt_lower}",
                     done=False,
+                    commit=False,  # Never commit for serialization status — too frequent
                 )
 
             try:
@@ -574,6 +587,7 @@ def _predict_batch_impl(
             total_steps=total_steps,
             message="Inference complete, finalizing outputs",
             done=False,
+            commit=True,  # Final inference status: always commit
         )
 
     return outputs

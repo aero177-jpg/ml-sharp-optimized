@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -20,6 +21,11 @@ progress_volume = modal.Volume.from_name(PROGRESS_VOLUME_NAME, create_if_missing
 
 _SAFE_JOB_ID = re.compile(r"[^a-zA-Z0-9._-]+")
 _WRITE_LOCKS: dict[str, threading.Lock] = defaultdict(threading.Lock)
+# Global lock to serialize volume commits across all threads in this container
+_COMMIT_LOCK = threading.Lock()
+
+_MAX_RETRIES = 3
+_RETRY_DELAY = 0.3
 
 
 def _sanitize_job_id(job_id: str) -> str:
@@ -52,34 +58,51 @@ def write_progress(job_id: str, data: dict[str, Any], *, commit: bool = True) ->
     path.parent.mkdir(parents=True, exist_ok=True)
 
     lock = _WRITE_LOCKS[job_id]
-    with lock:
-        snapshot = dict(data)
-        if path.exists():
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(existing, dict):
-                    merged = dict(existing)
-                    merged.update(snapshot)
-                    snapshot = merged
-            except json.JSONDecodeError:
-                pass
 
-        snapshot["job_id"] = job_id
-        snapshot["updated_at"] = _now_iso()
+    for attempt in range(_MAX_RETRIES):
+        try:
+            with lock:
+                snapshot = dict(data)
+                if path.exists():
+                    try:
+                        existing = json.loads(path.read_text(encoding="utf-8"))
+                        if isinstance(existing, dict):
+                            merged = dict(existing)
+                            merged.update(snapshot)
+                            snapshot = merged
+                    except (json.JSONDecodeError, OSError):
+                        pass
 
-        step = snapshot.get("step")
-        total_steps = snapshot.get("total_steps")
-        if isinstance(step, (int, float)) and isinstance(total_steps, (int, float)) and total_steps:
-            snapshot["percent"] = int(max(0.0, min(100.0, 100.0 * float(step) / float(total_steps))))
+                snapshot["job_id"] = job_id
+                snapshot["updated_at"] = _now_iso()
 
-        temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-        temp_path.write_text(json.dumps(snapshot), encoding="utf-8")
-        temp_path.replace(path)
+                step = snapshot.get("step")
+                total_steps = snapshot.get("total_steps")
+                if isinstance(step, (int, float)) and isinstance(total_steps, (int, float)) and total_steps:
+                    snapshot["percent"] = int(max(0.0, min(100.0, 100.0 * float(step) / float(total_steps))))
 
-        if commit:
-            progress_volume.commit()
+                # Write directly to the target path instead of using a temp file rename.
+                # Modal volumes don't support atomic rename reliably across concurrent commits.
+                path.write_text(json.dumps(snapshot), encoding="utf-8")
 
-    return snapshot
+            if commit:
+                with _COMMIT_LOCK:
+                    progress_volume.commit()
+
+            return snapshot
+
+        except PermissionError:
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(_RETRY_DELAY * (attempt + 1))
+                # Reload volume to sync filesystem state before retry
+                try:
+                    progress_volume.reload()
+                except Exception:
+                    pass
+            else:
+                raise
+
+    return snapshot  # unreachable, but keeps type checker happy
 
 
 def write_status(
@@ -121,3 +144,64 @@ def read_progress(job_id: str) -> dict[str, Any] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+
+
+def delete_progress(job_id: str, *, commit: bool = True) -> bool:
+    """Remove the progress file for a completed/failed job.
+
+    Args:
+        job_id: Job identifier.
+        commit: Whether to commit the Modal volume.
+
+    Returns:
+        True if the file was deleted, False if it didn't exist.
+    """
+    path = _job_path(job_id)
+    lock = _WRITE_LOCKS[job_id]
+    try:
+        with lock:
+            if path.exists():
+                path.unlink()
+            else:
+                return False
+        if commit:
+            with _COMMIT_LOCK:
+                progress_volume.commit()
+        # Clean up the per-job lock to prevent unbounded dict growth
+        _WRITE_LOCKS.pop(job_id, None)
+        return True
+    except OSError:
+        return False
+
+
+def cleanup_stale_progress_files(*, max_age_hours: int = 24) -> int:
+    """Remove progress files older than max_age_hours.
+
+    Intended as a safety net for orphaned files from crashed jobs.
+
+    Args:
+        max_age_hours: Delete files older than this many hours.
+
+    Returns:
+        Number of files removed.
+    """
+    progress_dir = Path(PROGRESS_VOLUME_PATH)
+    if not progress_dir.exists():
+        return 0
+
+    cutoff = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
+    removed = 0
+
+    for f in progress_dir.glob("*.json"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError:
+            continue
+
+    if removed > 0:
+        with _COMMIT_LOCK:
+            progress_volume.commit()
+
+    return removed

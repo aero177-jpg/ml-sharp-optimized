@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import mimetypes
 import os
-import queue
 import re
 import shutil
 import threading
@@ -98,7 +98,14 @@ api_image = (
 
 # Import volume/constants from app.py at deploy time (runs locally)
 from sharp.modal.app import MODEL_CACHE_PATH, TIMEOUT_SECONDS, model_volume
-from sharp.modal.progress import PROGRESS_VOLUME_PATH, progress_volume, read_progress, write_status
+from sharp.modal.progress import (
+    PROGRESS_VOLUME_PATH,
+    cleanup_stale_progress_files,
+    delete_progress,
+    progress_volume,
+    read_progress,
+    write_status,
+)
 
 # Separate Modal app for the HTTP endpoint
 app = modal.App(name=APP_NAME)
@@ -522,11 +529,17 @@ def _cleanup_expired_results() -> int:
     **_MAINTENANCE_KWARGS,
 )
 def cleanup_expired_results_job() -> dict[str, int]:
-    """Periodic cleanup for expired temporary result files."""
+    """Periodic cleanup for expired temporary result files and orphaned progress files."""
     removed = _cleanup_expired_results()
     if removed:
         logger.info("Removed %d expired result job(s)", removed)
-    return {"removed": removed}
+
+    # Also clean up orphaned progress files (e.g., from crashed jobs)
+    stale_count = cleanup_stale_progress_files(max_age_hours=24)
+    if stale_count:
+        logger.info("Cleaned up %d stale progress files", stale_count)
+
+    return {"removed": removed, "stale_progress_removed": stale_count}
 
 
 def _authorize_request(request: Request) -> Response | None:
@@ -680,7 +693,13 @@ def _process_job_impl(
     files: list[dict[str, str]] = []
     file_errors: list[dict[str, str]] = []
     state_lock = threading.Lock()
-    upload_queue: queue.Queue[tuple[str, bytes, int, int] | None] = queue.Queue(maxsize=8)
+
+    # Use a thread pool for concurrent uploads so the GPU thread is never blocked.
+    # max_workers=3 gives good upload throughput without overwhelming the endpoint.
+    upload_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=3, thread_name_prefix=f"upload-{job_id[:8]}"
+    )
+    upload_futures: list[concurrent.futures.Future] = []
 
     if storage_target == "r2":
         required = ("s3Endpoint", "s3AccessKeyId", "s3SecretAccessKey", "s3Bucket")
@@ -743,72 +762,66 @@ def _process_job_impl(
             results_url=results_url if result_type == "temp" else None,
         )
 
-    def _upload_worker() -> None:
-        nonlocal files
-        while True:
-            item = upload_queue.get()
-            if item is None:
-                upload_queue.task_done()
-                break
-
-            output_name, file_bytes, image_index, total_images = item
-            try:
-                if storage_target == "r2":
-                    url = _upload_to_r2(file_content=file_bytes, filename=output_name, config=r2_config)
-                    object_key = f"{prefix}/{output_name}".strip("/")
-                    file_entry = {"name": output_name, "path": object_key, "url": url}
-                elif storage_target == "supabase":
-                    object_key = str(Path(supabase_prefix) / output_name)
-                    file_handle = BytesIO(file_bytes)
-                    assert supabase_client is not None
-                    supabase_client.storage.from_(bucket).upload(
-                        object_key,
-                        file_handle.getvalue(),
-                        {
-                            "content-type": "application/octet-stream",
-                            "upsert": "true",
-                        },
-                    )
-                    url = supabase_client.storage.from_(bucket).get_public_url(object_key)
-                    file_entry = {"name": output_name, "path": object_key, "url": url}
-                else:
-                    file_entry = _upsert_temp_output(
-                        job_id=job_id,
-                        output_name=output_name,
-                        file_bytes=file_bytes,
-                        download_base_url=download_base_url,
-                        ttl_seconds=ttl_seconds,
-                    )
-
-                with state_lock:
-                    files = [entry for entry in files if entry.get("name") != file_entry.get("name")]
-                    files.append(file_entry)
-
-                _write_progress(
-                    phase="uploading_or_staging_results",
-                    message=f"Ready: {output_name} ({image_index}/{total_images})",
-                    step=image_index,
-                    done=False,
+    def _deliver_output(
+        output_name: str, file_bytes: bytes, image_index: int, total_images: int
+    ) -> None:
+        """Upload/stage a single output file. Runs on a background thread."""
+        try:
+            if storage_target == "r2":
+                url = _upload_to_r2(file_content=file_bytes, filename=output_name, config=r2_config)
+                object_key = f"{prefix}/{output_name}".strip("/")
+                file_entry = {"name": output_name, "path": object_key, "url": url}
+            elif storage_target == "supabase":
+                object_key = str(Path(supabase_prefix) / output_name)
+                file_handle = BytesIO(file_bytes)
+                assert supabase_client is not None
+                supabase_client.storage.from_(bucket).upload(
+                    object_key,
+                    file_handle.getvalue(),
+                    {
+                        "content-type": "application/octet-stream",
+                        "upsert": "true",
+                    },
                 )
-            except Exception as exc:
-                error_message = f"{output_name}: {exc}"
-                logger.exception("Failed delivering output %s", output_name)
-                with state_lock:
-                    file_errors.append({"name": output_name, "error": error_message})
-                _write_progress(
-                    phase="uploading_or_staging_results",
-                    message=f"Failed delivering {output_name}: {exc}",
-                    step=image_index,
-                    done=False,
+                url = supabase_client.storage.from_(bucket).get_public_url(object_key)
+                file_entry = {"name": output_name, "path": object_key, "url": url}
+            else:
+                file_entry = _upsert_temp_output(
+                    job_id=job_id,
+                    output_name=output_name,
+                    file_bytes=file_bytes,
+                    download_base_url=download_base_url,
+                    ttl_seconds=ttl_seconds,
                 )
-            finally:
-                upload_queue.task_done()
 
-    upload_thread = threading.Thread(target=_upload_worker, name=f"deliver-{job_id}", daemon=True)
-    upload_thread.start()
+            with state_lock:
+                files[:] = [entry for entry in files if entry.get("name") != file_entry.get("name")]
+                files.append(file_entry)
+
+            _write_progress(
+                phase="uploading_or_staging_results",
+                message=f"Ready: {output_name} ({image_index}/{total_images})",
+                step=image_index,
+                done=False,
+            )
+        except Exception as exc:
+            error_message = f"{output_name}: {exc}"
+            logger.exception("Failed delivering output %s", output_name)
+            with state_lock:
+                file_errors.append({"name": output_name, "error": error_message})
+            _write_progress(
+                phase="uploading_or_staging_results",
+                message=f"Failed delivering {output_name}: {exc}",
+                step=image_index,
+                done=False,
+            )
 
     def _on_output(output_name: str, file_bytes: bytes, image_index: int, total_images: int) -> None:
-        upload_queue.put((output_name, file_bytes, image_index, total_images))
+        """Submit upload work to the thread pool — returns immediately, never blocks GPU."""
+        future = upload_executor.submit(
+            _deliver_output, output_name, file_bytes, image_index, total_images
+        )
+        upload_futures.append(future)
 
     def _on_error(item_name: str, error_message: str, image_index: int, total_images: int) -> None:
         with state_lock:
@@ -846,9 +859,15 @@ def _process_job_impl(
     except Exception as exc:
         failure = exc
     finally:
-        upload_queue.put(None)
-        upload_queue.join()
-        upload_thread.join()
+        # Wait for all in-flight uploads to finish before finalizing.
+        # Each future's exception is already handled inside _deliver_output,
+        # but we still call .result() to surface unexpected errors.
+        for fut in concurrent.futures.as_completed(upload_futures):
+            try:
+                fut.result()
+            except Exception as exc:
+                logger.error("Unexpected upload error: %s", exc, exc_info=True)
+        upload_executor.shutdown(wait=True)
 
     if failure is not None:
         _write_progress(
@@ -883,6 +902,15 @@ def _process_job_impl(
     if result_type == "temp":
         result["results_url"] = results_url
         result["expires_at"] = expires_at
+
+    # Clean up the progress file now that the job is fully done.
+    # Results are tracked via the manifest in _RESULTS_ROOT; the
+    # top-level progress JSON is no longer needed.
+    try:
+        delete_progress(job_id, commit=True)
+    except Exception:
+        logger.warning("Failed to delete progress file for %s", job_id, exc_info=True)
+
     return result
 
 
