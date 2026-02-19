@@ -330,6 +330,28 @@ _GPU_JOB_DISPATCH = {
 _SAFE_JOB_ID = re.compile(r"[^a-zA-Z0-9._-]+")
 _RESULTS_ROOT = Path(PROGRESS_VOLUME_PATH) / "results"
 
+# Per-job lock for serializing manifest reads/writes across upload threads
+_MANIFEST_LOCKS: dict[str, threading.Lock] = {}
+_MANIFEST_LOCKS_GUARD = threading.Lock()
+
+# Global lock for volume commits (shared with progress.py's _COMMIT_LOCK pattern)
+_VOLUME_COMMIT_LOCK = threading.Lock()
+
+_UPSERT_MAX_RETRIES = 3
+_UPSERT_RETRY_DELAY = 0.4
+
+# Seconds to wait after job completion before cleaning up temp results.
+# Gives the frontend time to finish downloading before files are removed.
+_DEFERRED_CLEANUP_DELAY_SECONDS = 300
+
+
+def _get_manifest_lock(job_id: str) -> threading.Lock:
+    """Get or create a per-job lock for manifest operations."""
+    with _MANIFEST_LOCKS_GUARD:
+        if job_id not in _MANIFEST_LOCKS:
+            _MANIFEST_LOCKS[job_id] = threading.Lock()
+        return _MANIFEST_LOCKS[job_id]
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -412,7 +434,8 @@ def _create_manifest(job_id: str, ttl_seconds: int) -> dict:
         "files": [],
     }
     _manifest_path(job_id).write_text(json.dumps(manifest), encoding="utf-8")
-    progress_volume.commit()
+    with _VOLUME_COMMIT_LOCK:
+        progress_volume.commit()
     return manifest
 
 
@@ -423,18 +446,15 @@ def _upsert_temp_output(
     download_base_url: str,
     ttl_seconds: int,
 ) -> dict:
-    import json
+    """Write a file to temp storage and update the manifest.
 
-    manifest = _load_manifest(job_id)
-    if not manifest:
-        manifest = _create_manifest(job_id, ttl_seconds)
+    Thread-safe: serialized per-job via _MANIFEST_LOCKS, with retry
+    logic for transient volume errors.
+    """
+    import json
+    import time
 
     filename = Path(output_name).name
-    result_dir = _result_dir(job_id)
-    result_dir.mkdir(parents=True, exist_ok=True)
-    file_path = result_dir / filename
-    file_path.write_bytes(file_bytes)
-
     job_id_q = quote(job_id, safe="")
     filename_q = quote(filename, safe="")
     file_entry = {
@@ -444,28 +464,81 @@ def _upsert_temp_output(
         "download_url": f"{download_base_url}/?job_id={job_id_q}&name={filename_q}",
     }
 
-    files = manifest.get("files", [])
-    if not isinstance(files, list):
-        files = []
-    files = [item for item in files if not (isinstance(item, dict) and item.get("name") == filename)]
-    files.append(file_entry)
-    manifest["files"] = files
+    lock = _get_manifest_lock(job_id)
 
-    _manifest_path(job_id).write_text(json.dumps(manifest), encoding="utf-8")
-    progress_volume.commit()
-    return file_entry
+    for attempt in range(_UPSERT_MAX_RETRIES):
+        try:
+            with lock:
+                result_dir = _result_dir(job_id)
+                result_dir.mkdir(parents=True, exist_ok=True)
+
+                # Write the file bytes first
+                file_path = result_dir / filename
+                file_path.write_bytes(file_bytes)
+
+                # Read existing manifest or create one
+                manifest_path = _manifest_path(job_id)
+                manifest = None
+                if manifest_path.exists():
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError):
+                        manifest = None
+                if not isinstance(manifest, dict):
+                    manifest = _create_manifest(job_id, ttl_seconds)
+
+                # Update manifest file list
+                files = manifest.get("files", [])
+                if not isinstance(files, list):
+                    files = []
+                files = [item for item in files if not (isinstance(item, dict) and item.get("name") == filename)]
+                files.append(file_entry)
+                manifest["files"] = files
+
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            # Commit outside the manifest lock to avoid holding it during I/O
+            with _VOLUME_COMMIT_LOCK:
+                progress_volume.commit()
+
+            return file_entry
+
+        except (PermissionError, OSError) as exc:
+            if attempt < _UPSERT_MAX_RETRIES - 1:
+                logger.warning(
+                    "_upsert_temp_output attempt %d failed for %s: %s",
+                    attempt + 1, output_name, exc,
+                )
+                time.sleep(_UPSERT_RETRY_DELAY * (attempt + 1))
+                try:
+                    progress_volume.reload()
+                except Exception:
+                    pass
+            else:
+                raise
+
+    return file_entry  # unreachable
 
 
-def _load_manifest(job_id: str) -> dict | None:
+def _load_manifest(job_id: str, *, reload: bool = True) -> dict | None:
+    """Load the manifest for a job.
+
+    Args:
+        job_id: Job identifier.
+        reload: Whether to reload the volume first. Set False when the caller
+                already holds a lock or has just committed.
+    """
     import json
 
-    progress_volume.reload()
+    if reload:
+        progress_volume.reload()
+
     path = _manifest_path(job_id)
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(data, dict):
         return None
@@ -487,10 +560,56 @@ def _remove_job_results(job_id: str) -> None:
     result_dir = _result_dir(job_id)
     if result_dir.exists():
         shutil.rmtree(result_dir)
-        progress_volume.commit()
+        with _VOLUME_COMMIT_LOCK:
+            progress_volume.commit()
+    # Clean up manifest lock to prevent unbounded growth
+    with _MANIFEST_LOCKS_GUARD:
+        _MANIFEST_LOCKS.pop(job_id, None)
+
+
+def _cleanup_job_results(job_id: str) -> None:
+    """Remove all temp result files, manifest, and progress for a job.
+
+    Idempotent — safe to call multiple times or if already cleaned.
+    """
+    result_dir = _result_dir(job_id)
+    removed = False
+
+    try:
+        if result_dir.exists():
+            shutil.rmtree(result_dir, ignore_errors=True)
+            removed = True
+    except OSError:
+        logger.warning("Failed to rmtree results for %s", job_id, exc_info=True)
+
+    try:
+        delete_progress(job_id, commit=False)
+    except Exception:
+        logger.warning("Failed to delete progress for %s", job_id, exc_info=True)
+
+    if removed:
+        try:
+            with _VOLUME_COMMIT_LOCK:
+                progress_volume.commit()
+        except Exception:
+            logger.warning("Failed to commit after cleanup for %s", job_id, exc_info=True)
+
+    # Clean up the manifest lock
+    with _MANIFEST_LOCKS_GUARD:
+        _MANIFEST_LOCKS.pop(job_id, None)
+
+    logger.info("Cleaned up job %s (results_removed=%s)", job_id, removed)
 
 
 def _cleanup_expired_results() -> int:
+    """Remove expired or orphaned job result directories.
+
+    Handles:
+    - Jobs with valid manifests whose expires_at has passed
+    - Jobs with missing or corrupt manifests (age-based fallback)
+    - Orphaned directories with no manifest
+    Also cleans up each job's progress file.
+    """
     import json
 
     progress_volume.reload()
@@ -498,29 +617,66 @@ def _cleanup_expired_results() -> int:
         return 0
 
     now = _now_utc()
+    now_ts = now.timestamp()
     removed = 0
+
     for job_dir in _RESULTS_ROOT.iterdir():
         if not job_dir.is_dir():
             continue
+
+        job_id = job_dir.name
         manifest_path = job_dir / "manifest.json"
-        if not manifest_path.exists():
-            shutil.rmtree(job_dir, ignore_errors=True)
-            removed += 1
-            continue
+        should_remove = False
 
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            expires_raw = manifest.get("expires_at")
-            expires_at = datetime.fromisoformat(expires_raw) if isinstance(expires_raw, str) else None
-        except Exception:
-            expires_at = None
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                expires_raw = manifest.get("expires_at")
+                if isinstance(expires_raw, str):
+                    expires_at = datetime.fromisoformat(expires_raw)
+                    if now >= expires_at:
+                        should_remove = True
+                else:
+                    # No expires_at field — fall back to directory age
+                    dir_age_hours = (now_ts - job_dir.stat().st_mtime) / 3600
+                    if dir_age_hours > 1:
+                        should_remove = True
+            except Exception:
+                # Corrupt manifest — remove if old enough
+                try:
+                    dir_age_hours = (now_ts - job_dir.stat().st_mtime) / 3600
+                    if dir_age_hours > 1:
+                        should_remove = True
+                except OSError:
+                    should_remove = True
+        else:
+            # No manifest at all — orphaned directory, check age
+            try:
+                dir_age_hours = (now_ts - job_dir.stat().st_mtime) / 3600
+                if dir_age_hours > 1:
+                    should_remove = True
+            except OSError:
+                should_remove = True
 
-        if expires_at is None or expires_at <= now:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            removed += 1
+        if should_remove:
+            try:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                removed += 1
+                # Also clean up the progress file
+                try:
+                    delete_progress(job_id, commit=False)
+                except Exception:
+                    pass
+            except Exception:
+                logger.warning("Failed to remove %s", job_dir, exc_info=True)
 
     if removed:
-        progress_volume.commit()
+        try:
+            with _VOLUME_COMMIT_LOCK:
+                progress_volume.commit()
+        except Exception:
+            logger.warning("Failed to commit after cron cleanup", exc_info=True)
+
     return removed
 
 
@@ -539,7 +695,10 @@ def cleanup_expired_results_job() -> dict[str, int]:
     if stale_count:
         logger.info("Cleaned up %d stale progress files", stale_count)
 
-    return {"removed": removed, "stale_progress_removed": stale_count}
+    return {
+        "expired_dirs_removed": removed,
+        "stale_progress_removed": stale_count,
+    }
 
 
 def _authorize_request(request: Request) -> Response | None:
@@ -906,10 +1065,25 @@ def _process_job_impl(
     # Clean up the progress file now that the job is fully done.
     # Results are tracked via the manifest in _RESULTS_ROOT; the
     # top-level progress JSON is no longer needed.
-    try:
-        delete_progress(job_id, commit=True)
-    except Exception:
-        logger.warning("Failed to delete progress file for %s", job_id, exc_info=True)
+    # NOTE: Do NOT delete_progress here — the frontend still needs it
+    # to discover download URLs. The cron job cleans it up after 24h.
+
+    # Schedule deferred cleanup — gives the frontend time to download,
+    # then removes temp files regardless of whether consume=true was used.
+    if result_type == "temp":
+        import time as _time
+
+        def _deferred_cleanup() -> None:
+            _time.sleep(_DEFERRED_CLEANUP_DELAY_SECONDS)
+            logger.info("Running deferred cleanup for job %s", job_id)
+            _cleanup_job_results(job_id)
+
+        cleanup_thread = threading.Thread(
+            target=_deferred_cleanup,
+            name=f"cleanup-{job_id[:8]}",
+            daemon=True,
+        )
+        cleanup_thread.start()
 
     return result
 
@@ -1197,7 +1371,9 @@ def get_results(request: Request, job_id: str):
 def download_result(request: Request, job_id: str, name: str, consume: bool = True):
     """Download one temporary result file.
 
-    By default `consume=true`, which deletes the file after it is read.
+    By default ``consume=true``, which deletes the file after it is read.
+    Concurrent downloads are safe: each request locks the manifest while
+    mutating it, and file bytes are read before any deletion.
     """
     import json
 
@@ -1226,56 +1402,87 @@ def download_result(request: Request, job_id: str, name: str, consume: bool = Tr
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
+    # Read file bytes BEFORE any mutations so concurrent commits can't
+    # invalidate the local filesystem view underneath us.
     file_bytes = file_path.read_bytes()
     media_type = entry.get("content_type") if isinstance(entry, dict) else None
     if not isinstance(media_type, str) or not media_type:
         media_type = mimetypes.guess_type(target_name)[0] or "application/octet-stream"
 
     if consume:
-        file_path.unlink(missing_ok=True)
-        remaining = [
-            item
-            for item in files
-            if isinstance(item, dict) and item.get("name") != target_name
-        ]
-        manifest["files"] = remaining
-        if remaining:
-            _manifest_path(job_id).write_text(json.dumps(manifest), encoding="utf-8")
-            progress_volume.commit()
-        else:
-            _remove_job_results(job_id)
+        lock = _get_manifest_lock(job_id)
+        with lock:
+            # Re-read manifest under lock — another download may have changed it
+            current_manifest = _load_manifest(job_id, reload=False) or manifest
+            current_files = current_manifest.get("files", [])
+            if not isinstance(current_files, list):
+                current_files = []
 
-        progress = read_progress(job_id) or {}
-        file_errors = progress.get("file_errors", [])
-        if not isinstance(file_errors, list):
-            file_errors = []
-        files_expected = progress.get("files_expected")
-        if not isinstance(files_expected, int):
-            files_expected = len(remaining)
-        total_steps = progress.get("total_steps")
-        if not isinstance(total_steps, int):
-            total_steps = 0
-        step = progress.get("step")
-        if not isinstance(step, int):
-            step = total_steps
-        write_status(
-            job_id,
-            status=str(progress.get("status") or "running"),
-            phase=str(progress.get("phase") or "uploading_or_staging_results"),
-            message=str(progress.get("message") or "Updated result files"),
-            step=step,
-            total_steps=total_steps,
-            done=bool(progress.get("done")),
-            result_type=str(progress.get("result_type") or "temp"),
-            files=remaining,
-            result_files=remaining,
-            files_ready=len(remaining),
-            files_expected=files_expected,
-            file_errors=file_errors,
-            expires_at=manifest.get("expires_at"),
-            results_url=progress.get("results_url"),
-            results_path=progress.get("results_path"),
-        )
+            remaining = [
+                item
+                for item in current_files
+                if isinstance(item, dict) and item.get("name") != target_name
+            ]
+            current_manifest["files"] = remaining
+
+            file_path.unlink(missing_ok=True)
+
+            if remaining:
+                _manifest_path(job_id).write_text(
+                    json.dumps(current_manifest), encoding="utf-8"
+                )
+            else:
+                # Last file consumed — remove the entire result directory
+                result_dir = _result_dir(job_id)
+                if result_dir.exists():
+                    shutil.rmtree(result_dir, ignore_errors=True)
+
+        # Commit outside the lock
+        with _VOLUME_COMMIT_LOCK:
+            progress_volume.commit()
+
+        # Update progress so the frontend sees the updated file list.
+        # This is lightweight and non-critical — best-effort.
+        try:
+            progress = read_progress(job_id) or {}
+            files_expected = progress.get("files_expected")
+            if not isinstance(files_expected, int):
+                files_expected = len(remaining)
+            total_steps = progress.get("total_steps")
+            if not isinstance(total_steps, int):
+                total_steps = 0
+            step = progress.get("step")
+            if not isinstance(step, int):
+                step = total_steps
+
+            write_status(
+                job_id,
+                status=str(progress.get("status") or "running"),
+                phase=str(progress.get("phase") or "uploading_or_staging_results"),
+                message=str(progress.get("message") or "Updated result files"),
+                step=step,
+                total_steps=total_steps,
+                done=bool(progress.get("done")),
+                result_type=str(progress.get("result_type") or "temp"),
+                files=remaining,
+                result_files=remaining,
+                files_ready=len(remaining),
+                files_expected=files_expected,
+                file_errors=progress.get("file_errors", []),
+                expires_at=current_manifest.get("expires_at"),
+                results_url=progress.get("results_url"),
+                results_path=progress.get("results_path"),
+                commit=False,  # Already committed above
+            )
+        except Exception:
+            logger.warning("Failed updating progress after consume for %s", job_id, exc_info=True)
+
+        # If all files consumed, clean up the progress file too
+        if not remaining:
+            try:
+                delete_progress(job_id, commit=True)
+            except Exception:
+                pass  # Cron will catch it
 
     response = Response(content=file_bytes, media_type=media_type)
     response.headers["Content-Disposition"] = _content_disposition_attachment(target_name)
