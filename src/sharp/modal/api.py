@@ -97,13 +97,14 @@ api_image = (
 )
 
 # Import volume/constants from app.py at deploy time (runs locally)
-from sharp.modal.app import MODEL_CACHE_PATH, TIMEOUT_SECONDS, model_volume
+from sharp.modal.app import MODEL_CACHE_PATH, TIMEOUT_SECONDS, JobCancelledError, model_volume
 from sharp.modal.progress import (
     PROGRESS_VOLUME_PATH,
     cleanup_stale_progress_files,
     delete_progress,
     progress_volume,
     read_progress,
+    request_cancellation,
     write_status,
 )
 
@@ -1029,6 +1030,25 @@ def _process_job_impl(
         upload_executor.shutdown(wait=True)
 
     if failure is not None:
+        is_cancel = isinstance(failure, JobCancelledError)
+        if is_cancel:
+            _write_progress(
+                phase="cancelled",
+                message="Job cancelled by user",
+                step=0,
+                done=True,
+                status="cancelled",
+            )
+            # Immediately clean up temp files on cancel
+            _cleanup_job_results(job_id)
+            return {
+                "job_id": job_id,
+                "result_type": result_type,
+                "status": "cancelled",
+                "files": [],
+                "file_errors": [],
+            }
+
         _write_progress(
             phase="failed",
             message=f"Failed: {failure}",
@@ -1303,6 +1323,66 @@ def get_progress(request: Request, job_id: str):
     if not progress:
         raise HTTPException(status_code=404, detail="Job not found")
     return progress
+
+
+@app.function(
+    **_WORKER_KWARGS,
+)
+@modal.fastapi_endpoint(method="POST")
+def cancel_job(request: Request, job_id: str):
+    """Cancel a running job and clean up all related resources.
+
+    Writes a cancel sentinel to the progress volume so the GPU inference
+    loop stops at the next image boundary.  Immediately cleans up any
+    temp result files and marks the progress as cancelled.
+    """
+    unauthorized = _authorize_request(request)
+    if unauthorized:
+        return unauthorized
+
+    if not job_id or not job_id.strip():
+        raise HTTPException(status_code=400, detail="job_id is required")
+
+    progress = read_progress(job_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # If already done/cancelled, just return current state
+    if progress.get("done"):
+        return {
+            "job_id": job_id,
+            "status": progress.get("status", "unknown"),
+            "message": "Job already finished",
+            "cancelled": progress.get("status") == "cancelled",
+        }
+
+    # 1. Write the cancel sentinel so the GPU loop stops
+    request_cancellation(job_id)
+
+    # 2. Update progress to cancelled immediately so the frontend sees it
+    write_status(
+        job_id,
+        status="cancelled",
+        phase="cancelled",
+        message="Job cancelled by user",
+        step=progress.get("step", 0),
+        total_steps=progress.get("total_steps", 0),
+        done=True,
+        commit=True,
+    )
+
+    # 3. Clean up temp result files immediately
+    try:
+        _cleanup_job_results(job_id)
+    except Exception:
+        logger.warning("Failed cleanup during cancel for %s", job_id, exc_info=True)
+
+    return {
+        "job_id": job_id,
+        "status": "cancelled",
+        "message": "Job cancelled and resources cleaned up",
+        "cancelled": True,
+    }
 
 
 @app.function(

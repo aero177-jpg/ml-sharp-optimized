@@ -41,6 +41,10 @@ modal_image = create_modal_image()
 from sharp.modal.progress import PROGRESS_VOLUME_PATH, progress_volume, write_status
 
 
+class JobCancelledError(Exception):
+    """Raised when a job has been cancelled by the frontend."""
+
+
 def _load_image_from_bytes(image_bytes: bytes, filename: str) -> tuple[np.ndarray, float]:
     """Load an image from bytes and extract focal length.
 
@@ -468,6 +472,15 @@ def _predict_batch_impl(
     LOGGER.info("Processing batch: %d image(s)", total_images)
 
     for index, (image_bytes, filename) in enumerate(image_batch, start=1):
+        # Check for cancellation between images. This reloads the volume
+        # to see cancel sentinel files written by the cancel endpoint.
+        if job_id:
+            from sharp.modal.progress import is_cancelled
+
+            if is_cancelled(job_id):
+                LOGGER.info("Job %s cancelled by user at image %d/%d", job_id, index, total_images)
+                raise JobCancelledError(f"Job cancelled at image {index}/{total_images}")
+
         LOGGER.info("Processing %s (%d/%d)", filename, index, total_images)
         if job_id:
             write_status(

@@ -39,6 +39,12 @@ def _job_path(job_id: str) -> Path:
     return Path(PROGRESS_VOLUME_PATH) / f"{safe_id}.json"
 
 
+def _cancel_path(job_id: str) -> Path:
+    """Path to the lightweight cancel sentinel file for a job."""
+    safe_id = _sanitize_job_id(job_id)
+    return Path(PROGRESS_VOLUME_PATH) / f"{safe_id}.cancel"
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -157,12 +163,19 @@ def delete_progress(job_id: str, *, commit: bool = True) -> bool:
         True if the file was deleted, False if it didn't exist.
     """
     path = _job_path(job_id)
+    cancel = _cancel_path(job_id)
     lock = _WRITE_LOCKS[job_id]
     try:
         with lock:
+            deleted = False
             if path.exists():
                 path.unlink()
-            else:
+                deleted = True
+            # Always clean up the cancel sentinel too
+            if cancel.exists():
+                cancel.unlink()
+                deleted = True
+            if not deleted:
                 return False
         if commit:
             with _COMMIT_LOCK:
@@ -172,6 +185,36 @@ def delete_progress(job_id: str, *, commit: bool = True) -> bool:
         return True
     except OSError:
         return False
+
+
+def request_cancellation(job_id: str) -> None:
+    """Write a cancel sentinel file for a job.
+
+    The inference loop checks for this file between images via
+    ``is_cancelled()``.  This is a lightweight file-exists check
+    that avoids JSON parsing on the hot path.
+    """
+    cancel = _cancel_path(job_id)
+    cancel.parent.mkdir(parents=True, exist_ok=True)
+    cancel.write_text(_now_iso(), encoding="utf-8")
+    with _COMMIT_LOCK:
+        progress_volume.commit()
+
+
+def is_cancelled(job_id: str, *, reload: bool = True) -> bool:
+    """Check whether a cancellation has been requested for a job.
+
+    Args:
+        job_id: Job identifier.
+        reload: Whether to reload the volume first (needed to see
+                writes from other containers).
+    """
+    if reload:
+        try:
+            progress_volume.reload()
+        except Exception:
+            pass
+    return _cancel_path(job_id).exists()
 
 
 def cleanup_stale_progress_files(*, max_age_hours: int = 24) -> int:
@@ -197,6 +240,10 @@ def cleanup_stale_progress_files(*, max_age_hours: int = 24) -> int:
             if f.stat().st_mtime < cutoff:
                 f.unlink()
                 removed += 1
+                # Also remove any matching cancel sentinel
+                cancel = f.with_suffix(".cancel")
+                if cancel.exists():
+                    cancel.unlink()
         except OSError:
             continue
 
