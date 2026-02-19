@@ -48,6 +48,16 @@ def write_progress(job_id: str, data: dict[str, Any], *, commit: bool = True) ->
     path.parent.mkdir(parents=True, exist_ok=True)
 
     snapshot = dict(data)
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                merged = dict(existing)
+                merged.update(snapshot)
+                snapshot = merged
+        except json.JSONDecodeError:
+            pass
+
     snapshot["job_id"] = job_id
     snapshot["updated_at"] = _now_iso()
 

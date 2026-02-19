@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 import mimetypes
 import os
+import queue
 import re
 import shutil
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -677,6 +679,8 @@ def _process_job_impl(
 
     files: list[dict[str, str]] = []
     file_errors: list[dict[str, str]] = []
+    state_lock = threading.Lock()
+    upload_queue: queue.Queue[tuple[str, bytes, int, int] | None] = queue.Queue(maxsize=8)
 
     if storage_target == "r2":
         required = ("s3Endpoint", "s3AccessKeyId", "s3SecretAccessKey", "s3Bucket")
@@ -710,69 +714,113 @@ def _process_job_impl(
         bucket = ""
         supabase_prefix = ""
 
-    def _on_output(output_name: str, file_bytes: bytes, image_index: int, total_images: int) -> None:
-        nonlocal files
-        if storage_target == "r2":
-            url = _upload_to_r2(file_content=file_bytes, filename=output_name, config=r2_config)
-            object_key = f"{prefix}/{output_name}".strip("/")
-            file_entry = {"name": output_name, "path": object_key, "url": url}
-        elif storage_target == "supabase":
-            object_key = str(Path(supabase_prefix) / output_name)
-            file_handle = BytesIO(file_bytes)
-            assert supabase_client is not None
-            supabase_client.storage.from_(bucket).upload(
-                object_key,
-                file_handle.getvalue(),
-                {
-                    "content-type": "application/octet-stream",
-                    "upsert": "true",
-                },
-            )
-            url = supabase_client.storage.from_(bucket).get_public_url(object_key)
-            file_entry = {"name": output_name, "path": object_key, "url": url}
-        else:
-            file_entry = _upsert_temp_output(
-                job_id=job_id,
-                output_name=output_name,
-                file_bytes=file_bytes,
-                download_base_url=download_base_url,
-                ttl_seconds=ttl_seconds,
-            )
+    def _state_snapshot() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        with state_lock:
+            return list(files), list(file_errors)
 
-        files = [item for item in files if item.get("name") != file_entry.get("name")]
-        files.append(file_entry)
+    def _write_progress(
+        *,
+        phase: str,
+        message: str,
+        step: int,
+        done: bool,
+        status: str = "running",
+    ) -> None:
+        current_files, current_errors = _state_snapshot()
         _update_incremental_progress(
             job_id,
             total_steps=total_steps,
             files_expected=files_expected,
-            files=files,
-            file_errors=file_errors,
-            phase="uploading_or_staging_results",
-            message=f"Ready: {output_name} ({image_index}/{total_images})",
-            step=image_index,
-            done=False,
+            files=current_files,
+            file_errors=current_errors,
+            phase=phase,
+            message=message,
+            step=step,
+            done=done,
+            status=status,
             result_type=result_type,
             expires_at=expires_at if isinstance(expires_at, str) else None,
             results_url=results_url if result_type == "temp" else None,
         )
 
+    def _upload_worker() -> None:
+        nonlocal files
+        while True:
+            item = upload_queue.get()
+            if item is None:
+                upload_queue.task_done()
+                break
+
+            output_name, file_bytes, image_index, total_images = item
+            try:
+                if storage_target == "r2":
+                    url = _upload_to_r2(file_content=file_bytes, filename=output_name, config=r2_config)
+                    object_key = f"{prefix}/{output_name}".strip("/")
+                    file_entry = {"name": output_name, "path": object_key, "url": url}
+                elif storage_target == "supabase":
+                    object_key = str(Path(supabase_prefix) / output_name)
+                    file_handle = BytesIO(file_bytes)
+                    assert supabase_client is not None
+                    supabase_client.storage.from_(bucket).upload(
+                        object_key,
+                        file_handle.getvalue(),
+                        {
+                            "content-type": "application/octet-stream",
+                            "upsert": "true",
+                        },
+                    )
+                    url = supabase_client.storage.from_(bucket).get_public_url(object_key)
+                    file_entry = {"name": output_name, "path": object_key, "url": url}
+                else:
+                    file_entry = _upsert_temp_output(
+                        job_id=job_id,
+                        output_name=output_name,
+                        file_bytes=file_bytes,
+                        download_base_url=download_base_url,
+                        ttl_seconds=ttl_seconds,
+                    )
+
+                with state_lock:
+                    files = [entry for entry in files if entry.get("name") != file_entry.get("name")]
+                    files.append(file_entry)
+
+                _write_progress(
+                    phase="uploading_or_staging_results",
+                    message=f"Ready: {output_name} ({image_index}/{total_images})",
+                    step=image_index,
+                    done=False,
+                )
+            except Exception as exc:
+                error_message = f"{output_name}: {exc}"
+                logger.exception("Failed delivering output %s", output_name)
+                with state_lock:
+                    file_errors.append({"name": output_name, "error": error_message})
+                _write_progress(
+                    phase="uploading_or_staging_results",
+                    message=f"Failed delivering {output_name}: {exc}",
+                    step=image_index,
+                    done=False,
+                )
+            finally:
+                upload_queue.task_done()
+
+    upload_thread = threading.Thread(target=_upload_worker, name=f"deliver-{job_id}", daemon=True)
+    upload_thread.start()
+
+    def _on_output(output_name: str, file_bytes: bytes, image_index: int, total_images: int) -> None:
+        upload_queue.put((output_name, file_bytes, image_index, total_images))
+
     def _on_error(item_name: str, error_message: str, image_index: int, total_images: int) -> None:
-        file_errors.append({"name": item_name, "error": error_message})
-        _update_incremental_progress(
-            job_id,
-            total_steps=total_steps,
-            files_expected=files_expected,
-            files=files,
-            file_errors=file_errors,
+        with state_lock:
+            file_errors.append({"name": item_name, "error": error_message})
+        _write_progress(
             phase="processing_images",
             message=f"Skipped {item_name}: {error_message}",
             step=image_index,
             done=False,
-            result_type=result_type,
-            expires_at=expires_at if isinstance(expires_at, str) else None,
-            results_url=results_url if result_type == "temp" else None,
         )
 
+    failure: Exception | None = None
     try:
         write_status(
             job_id,
@@ -796,48 +844,41 @@ def _process_job_impl(
             on_error=_on_error,
         )
     except Exception as exc:
-        _update_incremental_progress(
-            job_id,
-            total_steps=total_steps,
-            files_expected=files_expected,
-            files=files,
-            file_errors=file_errors,
+        failure = exc
+    finally:
+        upload_queue.put(None)
+        upload_queue.join()
+        upload_thread.join()
+
+    if failure is not None:
+        _write_progress(
             phase="failed",
-            message=f"Failed: {exc}",
+            message=f"Failed: {failure}",
             step=0,
             done=True,
             status="failed",
-            result_type=result_type,
-            expires_at=expires_at if isinstance(expires_at, str) else None,
-            results_url=results_url if result_type == "temp" else None,
         )
-        raise
+        raise failure
 
     completion_message = "Processing completed"
     if file_errors:
         completion_message = f"Completed with {len(file_errors)} file error(s)"
 
-    _update_incremental_progress(
-        job_id,
-        total_steps=total_steps,
-        files_expected=files_expected,
-        files=files,
-        file_errors=file_errors,
+    _write_progress(
         phase="completed",
         message=completion_message,
         step=total_steps,
         done=True,
         status="complete",
-        result_type=result_type,
-        expires_at=expires_at if isinstance(expires_at, str) else None,
-        results_url=results_url if result_type == "temp" else None,
     )
+
+    files_snapshot, file_errors_snapshot = _state_snapshot()
 
     result: dict[str, object] = {
         "job_id": job_id,
         "result_type": result_type,
-        "files": files,
-        "file_errors": file_errors,
+        "files": files_snapshot,
+        "file_errors": file_errors_snapshot,
     }
     if result_type == "temp":
         result["results_url"] = results_url
