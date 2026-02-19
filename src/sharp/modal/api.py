@@ -115,7 +115,7 @@ _WORKER_KWARGS = dict(
 _MAINTENANCE_KWARGS = dict(
     volumes={PROGRESS_VOLUME_PATH: progress_volume},
     timeout=300,
-    image=modal.Image.debian_slim(python_version="3.11"),
+    image=api_image,
 )
 
 
@@ -1204,53 +1204,50 @@ def download_result(request: Request, job_id: str, name: str, consume: bool = Tr
         media_type = mimetypes.guess_type(target_name)[0] or "application/octet-stream"
 
     if consume:
-        try:
-            file_path.unlink(missing_ok=True)
-            remaining = [
-                item
-                for item in files
-                if isinstance(item, dict) and item.get("name") != target_name
-            ]
-            manifest["files"] = remaining
-            if remaining:
-                _manifest_path(job_id).write_text(json.dumps(manifest), encoding="utf-8")
-                progress_volume.commit()
-            else:
-                _remove_job_results(job_id)
+        file_path.unlink(missing_ok=True)
+        remaining = [
+            item
+            for item in files
+            if isinstance(item, dict) and item.get("name") != target_name
+        ]
+        manifest["files"] = remaining
+        if remaining:
+            _manifest_path(job_id).write_text(json.dumps(manifest), encoding="utf-8")
+            progress_volume.commit()
+        else:
+            _remove_job_results(job_id)
 
-            progress = read_progress(job_id) or {}
-            file_errors = progress.get("file_errors", [])
-            if not isinstance(file_errors, list):
-                file_errors = []
-            files_expected = progress.get("files_expected")
-            if not isinstance(files_expected, int):
-                files_expected = len(remaining)
-            total_steps = progress.get("total_steps")
-            if not isinstance(total_steps, int):
-                total_steps = 0
-            step = progress.get("step")
-            if not isinstance(step, int):
-                step = total_steps
-            write_status(
-                job_id,
-                status=str(progress.get("status") or "running"),
-                phase=str(progress.get("phase") or "uploading_or_staging_results"),
-                message=str(progress.get("message") or "Updated result files"),
-                step=step,
-                total_steps=total_steps,
-                done=bool(progress.get("done")),
-                result_type=str(progress.get("result_type") or "temp"),
-                files=remaining,
-                result_files=remaining,
-                files_ready=len(remaining),
-                files_expected=files_expected,
-                file_errors=file_errors,
-                expires_at=manifest.get("expires_at"),
-                results_url=progress.get("results_url"),
-                results_path=progress.get("results_path"),
-            )
-        except Exception:
-            logger.exception("Failed to consume result file for job_id=%s name=%s", job_id, target_name)
+        progress = read_progress(job_id) or {}
+        file_errors = progress.get("file_errors", [])
+        if not isinstance(file_errors, list):
+            file_errors = []
+        files_expected = progress.get("files_expected")
+        if not isinstance(files_expected, int):
+            files_expected = len(remaining)
+        total_steps = progress.get("total_steps")
+        if not isinstance(total_steps, int):
+            total_steps = 0
+        step = progress.get("step")
+        if not isinstance(step, int):
+            step = total_steps
+        write_status(
+            job_id,
+            status=str(progress.get("status") or "running"),
+            phase=str(progress.get("phase") or "uploading_or_staging_results"),
+            message=str(progress.get("message") or "Updated result files"),
+            step=step,
+            total_steps=total_steps,
+            done=bool(progress.get("done")),
+            result_type=str(progress.get("result_type") or "temp"),
+            files=remaining,
+            result_files=remaining,
+            files_ready=len(remaining),
+            files_expected=files_expected,
+            file_errors=file_errors,
+            expires_at=manifest.get("expires_at"),
+            results_url=progress.get("results_url"),
+            results_path=progress.get("results_path"),
+        )
 
     response = Response(content=file_bytes, media_type=media_type)
     response.headers["Content-Disposition"] = _content_disposition_attachment(target_name)

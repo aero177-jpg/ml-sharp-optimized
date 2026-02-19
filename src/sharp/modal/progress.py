@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +19,7 @@ PROGRESS_VOLUME_PATH = "/cache/progress"
 progress_volume = modal.Volume.from_name(PROGRESS_VOLUME_NAME, create_if_missing=True)
 
 _SAFE_JOB_ID = re.compile(r"[^a-zA-Z0-9._-]+")
+_WRITE_LOCKS: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
 def _sanitize_job_id(job_id: str) -> str:
@@ -47,31 +51,33 @@ def write_progress(job_id: str, data: dict[str, Any], *, commit: bool = True) ->
     path = _job_path(job_id)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    snapshot = dict(data)
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                merged = dict(existing)
-                merged.update(snapshot)
-                snapshot = merged
-        except json.JSONDecodeError:
-            pass
+    lock = _WRITE_LOCKS[job_id]
+    with lock:
+        snapshot = dict(data)
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    merged = dict(existing)
+                    merged.update(snapshot)
+                    snapshot = merged
+            except json.JSONDecodeError:
+                pass
 
-    snapshot["job_id"] = job_id
-    snapshot["updated_at"] = _now_iso()
+        snapshot["job_id"] = job_id
+        snapshot["updated_at"] = _now_iso()
 
-    step = snapshot.get("step")
-    total_steps = snapshot.get("total_steps")
-    if isinstance(step, (int, float)) and isinstance(total_steps, (int, float)) and total_steps:
-        snapshot["percent"] = int(max(0.0, min(100.0, 100.0 * float(step) / float(total_steps))))
+        step = snapshot.get("step")
+        total_steps = snapshot.get("total_steps")
+        if isinstance(step, (int, float)) and isinstance(total_steps, (int, float)) and total_steps:
+            snapshot["percent"] = int(max(0.0, min(100.0, 100.0 * float(step) / float(total_steps))))
 
-    temp_path = path.with_suffix(".tmp")
-    temp_path.write_text(json.dumps(snapshot), encoding="utf-8")
-    temp_path.replace(path)
+        temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+        temp_path.write_text(json.dumps(snapshot), encoding="utf-8")
+        temp_path.replace(path)
 
-    if commit:
-        progress_volume.commit()
+        if commit:
+            progress_volume.commit()
 
     return snapshot
 
