@@ -322,87 +322,47 @@ def predict_gaussian_splat_h100(
     return _predict_batch_impl(image_batch, export_formats, job_id=job_id)
 
 
-def _predict_batch_impl(
-    image_batch: list[tuple[bytes, str]],
-    export_formats: tuple[str, ...],
-    job_id: str | None = None,
-    on_output: Callable[[str, bytes, int, int], None] | None = None,
-    on_error: Callable[[str, str, int, int], None] | None = None,
-) -> list[tuple[str, bytes]]:
-    """Shared implementation for all GPU variants.
+def _log_cuda_info() -> None:
+    import torch
 
-    This is called by the GPU-specific functions and contains the actual
-    inference logic (same as predict_gaussian_splat).
+    if not torch.cuda.is_available():
+        LOGGER.warning("CUDA not available. Falling back to CPU.")
+        return
+    try:
+        props = torch.cuda.get_device_properties(0)
+        summary = (
+            f"{props.name} (cc {props.major}.{props.minor}, "
+            f"{props.total_memory / (1024**3):.1f} GiB)"
+        )
+    except Exception as e:  # pragma: no cover - diagnostics only
+        summary = f"<unavailable: {e}>"
+    LOGGER.info("CUDA device: %s, runtime %s", summary, torch.version.cuda)
+
+
+def load_predictor(
+    device,
+    on_phase: Callable[[str, str], None] | None = None,
+):
+    """Load the SHARP predictor onto ``device``, downloading the checkpoint if needed.
+
+    The checkpoint is cached on the model Volume. ``on_phase(phase, message)``
+    is called at each step so callers can report progress.
     """
     import torch
-    import torch.nn.functional as F
 
     from sharp.models import PredictorParams, create_predictor
-    from sharp.utils.gaussians import save_sog, save_splat, unproject_gaussians
 
-    cuda_available = torch.cuda.is_available()
-    device = torch.device("cuda" if cuda_available else "cpu")
+    def phase(name: str, message: str) -> None:
+        if on_phase:
+            on_phase(name, message)
 
-    if not cuda_available:
-        LOGGER.warning("CUDA not available. Falling back to CPU.")
-    else:
-        try:
-            device_name = torch.cuda.get_device_name(0)
-        except Exception as e:
-            device_name = f"<unknown: {e}>"
-        try:
-            device_props = torch.cuda.get_device_properties(0)
-            device_summary = (
-                f"{device_props.name} (cc {device_props.major}.{device_props.minor}, "
-                f"{device_props.total_memory / (1024**3):.1f} GiB)"
-            )
-        except Exception as e:
-            device_summary = f"<unavailable: {e}>"
-
-        LOGGER.info("CUDA available: %s", cuda_available)
-        LOGGER.info("CUDA device count: %d", torch.cuda.device_count())
-        LOGGER.info("CUDA device name: %s", device_name)
-        LOGGER.info("CUDA device summary: %s", device_summary)
-        LOGGER.info("CUDA runtime version: %s", torch.version.cuda)
-
-    total_steps = len(image_batch)
-
-    # Use commit=False for intermediate status updates during inference
-    # to avoid volume commit contention with the parallel upload worker thread.
-    # The upload worker and critical checkpoints will commit explicitly.
-    _commit = on_output is None  # Only auto-commit if no parallel upload worker
-
-    if job_id:
-        write_status(
-            job_id,
-            status="running",
-            phase="preparing_gpu",
-            step=0,
-            total_steps=total_steps,
-            message="Preparing GPU runtime",
-            done=False,
-            commit=_commit,
-        )
-
-    # Load or download model
     model_path = Path(MODEL_CACHE_PATH) / "sharp_model.pt"
 
     def download_model() -> dict:
-        """Download model from URL and cache to volume."""
-        if job_id:
-            write_status(
-                job_id,
-                status="running",
-                phase="downloading_model",
-                step=0,
-                total_steps=total_steps,
-                message="Downloading model checkpoint",
-                done=False,
-                commit=True,  # Important checkpoint: always commit
-            )
-        LOGGER.info(f"Downloading model from {DEFAULT_MODEL_URL}")
+        phase("downloading_model", "Downloading model checkpoint")
+        LOGGER.info("Downloading model from %s", DEFAULT_MODEL_URL)
         state = torch.hub.load_state_dict_from_url(
-            DEFAULT_MODEL_URL, progress=True, map_location=device
+            DEFAULT_MODEL_URL, progress=True, map_location="cpu"
         )
         model_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(state, model_path)
@@ -410,58 +370,86 @@ def _predict_batch_impl(
         LOGGER.info("Model cached to volume")
         return state
 
-    if job_id:
-        write_status(
-            job_id,
-            status="running",
-            phase="checking_model_cache",
-            step=0,
-            total_steps=total_steps,
-            message="Checking model cache",
-            done=False,
-            commit=_commit,
-        )
-
+    phase("checking_model_cache", "Checking model cache")
     if model_path.exists():
-        LOGGER.info("Loading cached model from volume")
-        if job_id:
-            write_status(
-                job_id,
-                status="running",
-                phase="loading_model",
-                step=0,
-                total_steps=total_steps,
-                message="Loading cached model",
-                done=False,
-                commit=_commit,
-            )
+        phase("loading_model", "Loading cached model")
         try:
-            state_dict = torch.load(model_path, weights_only=True, map_location=device)
+            state_dict = torch.load(model_path, weights_only=True, map_location="cpu")
         except Exception as e:
-            LOGGER.warning(f"Cached model is corrupted: {e}")
-            LOGGER.info("Deleting corrupted cache and re-downloading...")
+            LOGGER.warning("Cached model is corrupted (%s); re-downloading", e)
             model_path.unlink()
             model_volume.commit()
             state_dict = download_model()
     else:
         state_dict = download_model()
 
-    gaussian_predictor = create_predictor(PredictorParams())
-    gaussian_predictor.load_state_dict(state_dict)
-    gaussian_predictor.eval()
-    gaussian_predictor.to(device)
+    predictor = create_predictor(PredictorParams())
+    predictor.load_state_dict(state_dict)
+    predictor.eval()
+    predictor.to(device)
+    phase("model_ready", "Model loaded and ready")
+    return predictor
 
-    if job_id:
-        write_status(
-            job_id,
-            status="running",
-            phase="model_ready",
-            step=0,
-            total_steps=total_steps,
-            message="Model loaded and ready",
-            done=False,
-            commit=_commit,
-        )
+
+def _predict_batch_impl(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: tuple[str, ...],
+    job_id: str | None = None,
+    on_output: Callable[[str, bytes, int, int], None] | None = None,
+    on_error: Callable[[str, str, int, int], None] | None = None,
+) -> list[tuple[str, bytes]]:
+    """Load the model, then run a batch. Used by the CLI's per-call functions.
+
+    The API's GPU worker loads the model once per container instead and calls
+    ``run_predictor_batch`` directly.
+    """
+    import torch
+
+    _log_cuda_info()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    total_steps = len(image_batch)
+
+    def on_phase(name: str, message: str) -> None:
+        if job_id:
+            write_status(
+                job_id,
+                status="running",
+                phase=name,
+                step=0,
+                total_steps=total_steps,
+                message=message,
+                done=False,
+            )
+
+    predictor = load_predictor(device, on_phase=on_phase)
+    return run_predictor_batch(
+        predictor,
+        device,
+        image_batch,
+        export_formats,
+        job_id=job_id,
+        on_output=on_output,
+        on_error=on_error,
+    )
+
+
+def run_predictor_batch(
+    gaussian_predictor,
+    device,
+    image_batch: list[tuple[bytes, str]],
+    export_formats: tuple[str, ...],
+    job_id: str | None = None,
+    on_output: Callable[[str, bytes, int, int], None] | None = None,
+    on_error: Callable[[str, str, int, int], None] | None = None,
+) -> list[tuple[str, bytes]]:
+    """Run inference + serialization for a batch with an already-loaded predictor."""
+    import torch
+    import torch.nn.functional as F
+
+    from sharp.utils.gaussians import save_sog, save_splat, unproject_gaussians
+
+    total_steps = len(image_batch)
+    _commit = on_output is None  # kept for the write_status signature; Dict ignores it
 
     export_formats_normalized = tuple(
         dict.fromkeys(fmt.lower() for fmt in export_formats)
@@ -474,8 +462,7 @@ def _predict_batch_impl(
     LOGGER.info("Processing batch: %d image(s)", total_images)
 
     for index, (image_bytes, filename) in enumerate(image_batch, start=1):
-        # Check for cancellation between images. This reloads the volume
-        # to see cancel sentinel files written by the cancel endpoint.
+        # Check for cancellation between images (a cheap Dict lookup).
         if job_id:
             from sharp.modal.progress import is_cancelled
 

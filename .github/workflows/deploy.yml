@@ -9,6 +9,8 @@ jobs:
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      # GPU memory snapshots (Modal alpha). Set the repo variable to 0 to fall back to CPU snapshots.
+      SHARP_GPU_SNAPSHOT: ${{ vars.SHARP_GPU_SNAPSHOT || '1' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

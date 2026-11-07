@@ -1,31 +1,40 @@
-"""Progress storage utilities for Modal polling."""
+"""Job progress and cancellation state for Modal polling.
+
+Progress snapshots and cancel flags live in a ``modal.Dict``: every write is
+immediately visible to every container, with no Volume commit/reload round
+trip. The frontend polls this on every tick, and the GPU loop checks the
+cancel flag between images, so both paths stay cheap.
+
+Result *files* still live on ``progress_volume`` (see ``sharp.modal.api``).
+
+The public functions keep their old signatures. ``commit=`` arguments are
+accepted and ignored, since Dict writes need no commit.
+"""
 
 from __future__ import annotations
 
-import json
 import re
 import threading
-import time
-import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import modal
 
+# Volume that holds temporary result files (not progress any more).
 PROGRESS_VOLUME_NAME = "sharp-progress"
 PROGRESS_VOLUME_PATH = "/cache/progress"
-
 progress_volume = modal.Volume.from_name(PROGRESS_VOLUME_NAME, create_if_missing=True)
 
-_SAFE_JOB_ID = re.compile(r"[^a-zA-Z0-9._-]+")
-_WRITE_LOCKS: dict[str, threading.Lock] = defaultdict(threading.Lock)
-# Global lock to serialize volume commits across all threads in this container
-_COMMIT_LOCK = threading.Lock()
+# Progress + cancel flags. Entries expire on their own after 7 days without access.
+PROGRESS_DICT_NAME = "sharp-job-progress"
+progress_store = modal.Dict.from_name(PROGRESS_DICT_NAME, create_if_missing=True)
 
-_MAX_RETRIES = 3
-_RETRY_DELAY = 0.3
+_SAFE_JOB_ID = re.compile(r"[^a-zA-Z0-9._-]+")
+# Serializes read-merge-write per job inside one container.
+_WRITE_LOCKS: dict[str, threading.Lock] = defaultdict(threading.Lock)
+
+_TERMINAL_STATUSES = {"cancelled"}
 
 
 def _sanitize_job_id(job_id: str) -> str:
@@ -34,15 +43,12 @@ def _sanitize_job_id(job_id: str) -> str:
     return _SAFE_JOB_ID.sub("_", job_id)
 
 
-def _job_path(job_id: str) -> Path:
-    safe_id = _sanitize_job_id(job_id)
-    return Path(PROGRESS_VOLUME_PATH) / f"{safe_id}.json"
+def _job_key(job_id: str) -> str:
+    return f"job:{_sanitize_job_id(job_id)}"
 
 
-def _cancel_path(job_id: str) -> Path:
-    """Path to the lightweight cancel sentinel file for a job."""
-    safe_id = _sanitize_job_id(job_id)
-    return Path(PROGRESS_VOLUME_PATH) / f"{safe_id}.cancel"
+def _cancel_key(job_id: str) -> str:
+    return f"cancel:{_sanitize_job_id(job_id)}"
 
 
 def _now_iso() -> str:
@@ -50,65 +56,33 @@ def _now_iso() -> str:
 
 
 def write_progress(job_id: str, data: dict[str, Any], *, commit: bool = True) -> dict[str, Any]:
-    """Write a progress snapshot for a job.
+    """Merge ``data`` into the job's progress snapshot and store it.
 
-    Args:
-        job_id: Job identifier.
-        data: Progress fields to store.
-        commit: Whether to commit the Modal volume.
-
-    Returns:
-        The stored progress snapshot.
+    A job marked ``cancelled`` stays cancelled: late writes from the worker
+    (an upload finishing after the user cancelled) cannot flip it back.
     """
-    path = _job_path(job_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    del commit  # Dict writes are visible immediately.
+    key = _job_key(job_id)
+    with _WRITE_LOCKS[job_id]:
+        existing = progress_store.get(key)
+        snapshot: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+        if (
+            snapshot.get("status") in _TERMINAL_STATUSES
+            and data.get("status") not in _TERMINAL_STATUSES
+        ):
+            # Keep the terminal status but let file lists etc. update.
+            data = {k: v for k, v in data.items() if k not in {"status", "phase", "done", "message"}}
+        snapshot.update(data)
+        snapshot["job_id"] = job_id
+        snapshot["updated_at"] = _now_iso()
 
-    lock = _WRITE_LOCKS[job_id]
+        step = snapshot.get("step")
+        total_steps = snapshot.get("total_steps")
+        if isinstance(step, (int, float)) and isinstance(total_steps, (int, float)) and total_steps:
+            snapshot["percent"] = int(max(0.0, min(100.0, 100.0 * float(step) / float(total_steps))))
 
-    for attempt in range(_MAX_RETRIES):
-        try:
-            with lock:
-                snapshot = dict(data)
-                if path.exists():
-                    try:
-                        existing = json.loads(path.read_text(encoding="utf-8"))
-                        if isinstance(existing, dict):
-                            merged = dict(existing)
-                            merged.update(snapshot)
-                            snapshot = merged
-                    except (json.JSONDecodeError, OSError):
-                        pass
-
-                snapshot["job_id"] = job_id
-                snapshot["updated_at"] = _now_iso()
-
-                step = snapshot.get("step")
-                total_steps = snapshot.get("total_steps")
-                if isinstance(step, (int, float)) and isinstance(total_steps, (int, float)) and total_steps:
-                    snapshot["percent"] = int(max(0.0, min(100.0, 100.0 * float(step) / float(total_steps))))
-
-                # Write directly to the target path instead of using a temp file rename.
-                # Modal volumes don't support atomic rename reliably across concurrent commits.
-                path.write_text(json.dumps(snapshot), encoding="utf-8")
-
-            if commit:
-                with _COMMIT_LOCK:
-                    progress_volume.commit()
-
-            return snapshot
-
-        except PermissionError:
-            if attempt < _MAX_RETRIES - 1:
-                time.sleep(_RETRY_DELAY * (attempt + 1))
-                # Reload volume to sync filesystem state before retry
-                try:
-                    progress_volume.reload()
-                except Exception:
-                    pass
-            else:
-                raise
-
-    return snapshot  # unreachable, but keeps type checker happy
+        progress_store.put(key, snapshot)
+    return snapshot
 
 
 def write_status(
@@ -137,118 +111,56 @@ def write_status(
 
 
 def read_progress(job_id: str) -> dict[str, Any] | None:
-    """Read the progress snapshot for a job.
-
-    Reloads the volume first so we see the latest writes from other containers.
-    """
-    progress_volume.reload()
-
-    path = _job_path(job_id)
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return None
+    """Return the job's progress snapshot, or None if unknown."""
+    value = progress_store.get(_job_key(job_id))
+    return value if isinstance(value, dict) else None
 
 
 def delete_progress(job_id: str, *, commit: bool = True) -> bool:
-    """Remove the progress file for a completed/failed job.
-
-    Args:
-        job_id: Job identifier.
-        commit: Whether to commit the Modal volume.
-
-    Returns:
-        True if the file was deleted, False if it didn't exist.
-    """
-    path = _job_path(job_id)
-    cancel = _cancel_path(job_id)
-    lock = _WRITE_LOCKS[job_id]
-    try:
-        with lock:
-            deleted = False
-            if path.exists():
-                path.unlink()
-                deleted = True
-            # Always clean up the cancel sentinel too
-            if cancel.exists():
-                cancel.unlink()
-                deleted = True
-            if not deleted:
-                return False
-        if commit:
-            with _COMMIT_LOCK:
-                progress_volume.commit()
-        # Clean up the per-job lock to prevent unbounded dict growth
-        _WRITE_LOCKS.pop(job_id, None)
-        return True
-    except OSError:
-        return False
+    """Remove a job's progress snapshot and cancel flag. Returns True if anything was removed."""
+    del commit
+    with _WRITE_LOCKS[job_id]:
+        removed_progress = progress_store.pop(_job_key(job_id), None) is not None
+        removed_cancel = progress_store.pop(_cancel_key(job_id), None) is not None
+    _WRITE_LOCKS.pop(job_id, None)
+    return removed_progress or removed_cancel
 
 
 def request_cancellation(job_id: str) -> None:
-    """Write a cancel sentinel file for a job.
-
-    The inference loop checks for this file between images via
-    ``is_cancelled()``.  This is a lightweight file-exists check
-    that avoids JSON parsing on the hot path.
-    """
-    cancel = _cancel_path(job_id)
-    cancel.parent.mkdir(parents=True, exist_ok=True)
-    cancel.write_text(_now_iso(), encoding="utf-8")
-    with _COMMIT_LOCK:
-        progress_volume.commit()
+    """Flag a job as cancelled. The GPU loop stops at the next image boundary."""
+    progress_store.put(_cancel_key(job_id), _now_iso())
 
 
 def is_cancelled(job_id: str, *, reload: bool = True) -> bool:
-    """Check whether a cancellation has been requested for a job.
-
-    Args:
-        job_id: Job identifier.
-        reload: Whether to reload the volume first (needed to see
-                writes from other containers).
-    """
-    if reload:
-        try:
-            progress_volume.reload()
-        except Exception:
-            pass
-    return _cancel_path(job_id).exists()
+    """Whether cancellation was requested for a job. ``reload`` is kept for compatibility."""
+    del reload
+    try:
+        return progress_store.contains(_cancel_key(job_id))
+    except Exception:
+        return False
 
 
 def cleanup_stale_progress_files(*, max_age_hours: int = 24) -> int:
-    """Remove progress files older than max_age_hours.
+    """Remove progress snapshots not updated for ``max_age_hours``.
 
-    Intended as a safety net for orphaned files from crashed jobs.
-
-    Args:
-        max_age_hours: Delete files older than this many hours.
-
-    Returns:
-        Number of files removed.
+    Safety net for crashed jobs; the Dict also expires idle entries after 7 days.
+    Returns the number of jobs removed.
     """
-    progress_dir = Path(PROGRESS_VOLUME_PATH)
-    if not progress_dir.exists():
-        return 0
-
-    cutoff = datetime.now(timezone.utc).timestamp() - (max_age_hours * 3600)
-    removed = 0
-
-    for f in progress_dir.glob("*.json"):
-        try:
-            if f.stat().st_mtime < cutoff:
-                f.unlink()
-                removed += 1
-                # Also remove any matching cancel sentinel
-                cancel = f.with_suffix(".cancel")
-                if cancel.exists():
-                    cancel.unlink()
-        except OSError:
+    cutoff = datetime.now(timezone.utc).timestamp() - max_age_hours * 3600
+    stale: list[str] = []
+    for key in list(progress_store.keys()):
+        if not isinstance(key, str) or not key.startswith("job:"):
             continue
+        value = progress_store.get(key)
+        updated = value.get("updated_at") if isinstance(value, dict) else None
+        try:
+            ts = datetime.fromisoformat(updated).timestamp() if isinstance(updated, str) else 0.0
+        except ValueError:
+            ts = 0.0
+        if ts < cutoff:
+            stale.append(key[len("job:"):])
 
-    if removed > 0:
-        with _COMMIT_LOCK:
-            progress_volume.commit()
-
-    return removed
+    for safe_id in stale:
+        progress_store.pop(f"job:{safe_id}", None)
+        progress_store.pop(f"cancel:{safe_id}", None)
+    return len(stale)

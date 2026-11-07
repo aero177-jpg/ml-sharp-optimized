@@ -1,4 +1,20 @@
-"""Modal FastAPI endpoint for SHARP inference and Supabase/R2 upload."""
+"""Modal deployment for the SHARP API.
+
+Layout:
+
+- ``SharpWorker``: GPU class. Loads the model once per container inside a memory
+  snapshot, so warm jobs skip model load and cold starts restore from the snapshot.
+  One class serves every GPU tier via ``with_options(gpu=...)``.
+- ``api``: a single FastAPI app on a slim image (no torch) that serves
+  ``/process``, ``/progress``, ``/cancel``, ``/results`` and ``/download``.
+- ``cleanup_expired_results_job``: hourly cleanup of temporary result files.
+
+Progress and cancel flags live in a ``modal.Dict`` (``sharp.modal.progress``);
+temporary result files live on the ``sharp-progress`` Volume.
+
+Deploy: ``modal deploy src/sharp/modal/api.py``. Set ``SHARP_GPU_SNAPSHOT=0`` at
+deploy time to fall back to CPU-only memory snapshots.
+"""
 
 from __future__ import annotations
 
@@ -26,7 +42,6 @@ logger = logging.getLogger("sharp.modal.api")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-# Updated App Name
 APP_NAME = "ml-sharp-optimized"
 
 # Secret names expected to be provisioned in Modal
@@ -39,12 +54,25 @@ DEFAULT_BUCKET = "3dgs-assets"
 DEFAULT_EXPORT_FORMATS: Sequence[str] = ("sog",)
 DEFAULT_RESULT_TTL_SECONDS = 60 * 60
 
-# Local repo path (resolved at deploy time on your machine, not in container)
-REMOTE_REPO_PATH = "/root/ml-sharp"
-REMOTE_SRC_PATH = f"{REMOTE_REPO_PATH}/src"
+DEFAULT_GPU = "a10"
+SUPPORTED_GPUS = ("t4", "l4", "a10", "a100", "h100")
+CPU_GPU_ALIASES = {"cpu", "none"}
 
-# ROBUST ROOT DETECTION: Works for Local Dev and GitHub Actions
+# GPU worker sizing. Post-processing (covariance decomposition, SOG encoding,
+# uploads) is CPU-bound; Modal's default request is only 0.125 cores.
+WORKER_CPU = 4.0
+# Keep a worker warm briefly after a job so back-to-back uploads reuse it.
+WORKER_SCALEDOWN_SECONDS = 120
+WEB_SCALEDOWN_SECONDS = 300
+WEB_MAX_CONCURRENT_REQUESTS = 50
+
+# GPU memory snapshots are an alpha Modal feature. On by default; deploy with
+# SHARP_GPU_SNAPSHOT=0 to snapshot on CPU and move the model to the GPU after restore.
+GPU_SNAPSHOT = os.environ.get("SHARP_GPU_SNAPSHOT", "1") != "0"
+
+
 def get_repo_root() -> Path | None:
+    """Repo root at deploy time (local or GitHub Actions); None inside containers."""
     if os.environ.get("MODAL_IS_REMOTE") == "1":
         return None
 
@@ -58,47 +86,21 @@ def get_repo_root() -> Path | None:
 
 REPO_ROOT = get_repo_root()
 
-# Build a Modal image with SHARP + API dependencies
-api_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "torch==2.5.1",
-        "torchvision==0.20.1",
-        index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .pip_install(
-        "timm>=1.0.0",
-        "scipy>=1.11.0",
-        "plyfile>=1.0.0",
-        "imageio>=2.30.0",
-        "pillow-heif>=0.16.0",
-        "numpy>=1.24.0",
-        "click>=8.0.0",
-        "fastapi",
-        "python-multipart",
-        "supabase",
-        "boto3",
-    )
-    .run_commands("pip install gsplat --no-build-isolation")
-    .env({"PYTHONPATH": REMOTE_SRC_PATH, "MODAL_IS_REMOTE": "1"})
-    .add_local_dir(
-        str(REPO_ROOT) if REPO_ROOT else "/dummy",
-        REMOTE_REPO_PATH,
-        ignore=[
-            ".git",
-            ".venv",
-            "__pycache__",
-            "node_modules",
-            ".conda",
-            "venv",
-            "output",
-        ],
-    )
+from sharp.modal.image import create_web_image, create_worker_image  # noqa: E402
+
+worker_image = create_worker_image(
+    REPO_ROOT, env={"SHARP_GPU_SNAPSHOT": "1" if GPU_SNAPSHOT else "0"}
 )
+web_image = create_web_image(REPO_ROOT)
 
 # Import volume/constants from app.py at deploy time (runs locally)
-from sharp.modal.app import MODEL_CACHE_PATH, TIMEOUT_SECONDS, JobCancelledError, model_volume
-from sharp.modal.progress import (
+from sharp.modal.app import (  # noqa: E402
+    MODEL_CACHE_PATH,
+    TIMEOUT_SECONDS,
+    JobCancelledError,
+    model_volume,
+)
+from sharp.modal.progress import (  # noqa: E402
     PROGRESS_VOLUME_PATH,
     cleanup_stale_progress_files,
     delete_progress,
@@ -108,24 +110,152 @@ from sharp.modal.progress import (
     write_status,
 )
 
-# Separate Modal app for the HTTP endpoint
 app = modal.App(name=APP_NAME)
+
+_AUTH_SECRETS = [modal.Secret.from_name(API_AUTH_SECRET_NAME)]
 
 _WORKER_KWARGS = dict(
     volumes={MODEL_CACHE_PATH: model_volume, PROGRESS_VOLUME_PATH: progress_volume},
     timeout=TIMEOUT_SECONDS,
-    image=api_image,
-    secrets=[
-        modal.Secret.from_name(API_AUTH_SECRET_NAME),
-    ],
+    image=worker_image,
+    secrets=_AUTH_SECRETS,
 )
 
 _MAINTENANCE_KWARGS = dict(
     volumes={PROGRESS_VOLUME_PATH: progress_volume},
     timeout=300,
-    image=api_image,
+    image=web_image,
 )
 
+
+def _run_batch_impl(
+    image_batch: list[tuple[bytes, str]],
+    export_formats: Sequence[str],
+    job_id: str | None,
+    predictor=None,
+    device=None,
+    on_output=None,
+    on_error=None,
+) -> list[tuple[str, bytes]]:
+    from sharp.modal.app import _predict_batch_impl, run_predictor_batch
+
+    if predictor is None:
+        return _predict_batch_impl(
+            image_batch=image_batch,
+            export_formats=tuple(export_formats),
+            job_id=job_id,
+            on_output=on_output,
+            on_error=on_error,
+        )
+    return run_predictor_batch(
+        predictor,
+        device,
+        image_batch,
+        tuple(export_formats),
+        job_id=job_id,
+        on_output=on_output,
+        on_error=on_error,
+    )
+
+
+# --------------------------------------------------------------------------- GPU worker
+
+
+@app.cls(
+    gpu=DEFAULT_GPU,
+    cpu=WORKER_CPU,
+    scaledown_window=WORKER_SCALEDOWN_SECONDS,
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True} if GPU_SNAPSHOT else {},
+    **_WORKER_KWARGS,
+)
+class SharpWorker:
+    """Holds a loaded SHARP predictor for the life of the container."""
+
+    @modal.enter(snap=True)
+    def load_model(self) -> None:
+        """Runs once before the snapshot is taken; restored containers skip it."""
+        import torch
+
+        from sharp.modal.app import load_predictor
+
+        on_gpu = GPU_SNAPSHOT and torch.cuda.is_available()
+        self.device = torch.device("cuda" if on_gpu else "cpu")
+        self.predictor = load_predictor(self.device)
+        if on_gpu:
+            self._warmup()
+
+    @modal.enter(snap=False)
+    def move_to_gpu(self) -> None:
+        """Runs after every restore. Moves the model to the GPU for CPU-only snapshots."""
+        import torch
+
+        from sharp.modal.app import _log_cuda_info
+
+        _log_cuda_info()
+        if self.device.type != "cuda" and torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            self.predictor.to(self.device)
+            self._warmup()
+
+    def _warmup(self) -> None:
+        """One dummy forward pass so kernel selection happens before the first job."""
+        import torch
+
+        try:
+            with torch.no_grad():
+                image = torch.zeros(1, 3, 1536, 1536, device=self.device)
+                self.predictor(image, torch.tensor([1.0], device=self.device))
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception:
+            logger.warning("Warmup forward pass failed; continuing", exc_info=True)
+
+    @modal.method()
+    def process_job(
+        self,
+        image_batch: list[tuple[bytes, str]],
+        export_formats: Sequence[str],
+        job_id: str,
+        storage_target: str,
+        access: dict[str, str],
+        prefix: str,
+        gpu_request: str,
+        ttl_seconds: int,
+        results_url: str,
+        download_base_url: str,
+    ) -> dict:
+        return _process_job_impl(
+            image_batch=image_batch,
+            export_formats=export_formats,
+            job_id=job_id,
+            storage_target=storage_target,
+            access=access,
+            prefix=prefix,
+            gpu_request=gpu_request,
+            ttl_seconds=ttl_seconds,
+            results_url=results_url,
+            download_base_url=download_base_url,
+            predictor=self.predictor,
+            device=self.device,
+        )
+
+
+@app.function(**_WORKER_KWARGS)
+def process_job_cpu(**kwargs) -> dict:
+    """CPU fallback (gpu=cpu). Slow; loads the model per call."""
+    return _process_job_impl(**kwargs)
+
+
+def _spawn_job(gpu_request: str, **job_kwargs) -> modal.FunctionCall:
+    """Start a job on the requested hardware and return its FunctionCall."""
+    if gpu_request in CPU_GPU_ALIASES:
+        return process_job_cpu.spawn(gpu_request=gpu_request, **job_kwargs)
+    worker_cls = SharpWorker if gpu_request == DEFAULT_GPU else SharpWorker.with_options(gpu=gpu_request)
+    return worker_cls().process_job.spawn(gpu_request=gpu_request, **job_kwargs)
+
+
+# --------------------------------------------------------------------------- shared helpers
 
 def _parse_access_string(access_string: str) -> dict[str, str]:
     """Parse an access string into a dict.
@@ -167,167 +297,6 @@ def _parse_access_string(access_string: str) -> dict[str, str]:
     return parsed
 
 
-def _run_batch_impl(
-    image_batch: list[tuple[bytes, str]],
-    export_formats: Sequence[str],
-    job_id: str | None,
-    on_output=None,
-    on_error=None,
-) -> list[tuple[str, bytes]]:
-    from sharp.modal.app import _predict_batch_impl
-
-    return _predict_batch_impl(
-        image_batch=image_batch,
-        export_formats=tuple(export_formats),
-        job_id=job_id,
-        on_output=on_output,
-        on_error=on_error,
-    )
-
-
-@app.function(gpu="a10", **_WORKER_KWARGS)
-def _process_job_on_a10(
-    image_batch: list[tuple[bytes, str]],
-    export_formats: Sequence[str],
-    job_id: str,
-    storage_target: str,
-    access: dict[str, str],
-    prefix: str,
-    gpu_request: str,
-    ttl_seconds: int,
-    results_url: str,
-    download_base_url: str,
-):
-    return _process_job_impl(
-        image_batch=image_batch,
-        export_formats=export_formats,
-        job_id=job_id,
-        storage_target=storage_target,
-        access=access,
-        prefix=prefix,
-        gpu_request=gpu_request,
-        ttl_seconds=ttl_seconds,
-        results_url=results_url,
-        download_base_url=download_base_url,
-    )
-
-
-@app.function(gpu="t4", **_WORKER_KWARGS)
-def _process_job_on_t4(
-    image_batch: list[tuple[bytes, str]],
-    export_formats: Sequence[str],
-    job_id: str,
-    storage_target: str,
-    access: dict[str, str],
-    prefix: str,
-    gpu_request: str,
-    ttl_seconds: int,
-    results_url: str,
-    download_base_url: str,
-):
-    return _process_job_impl(
-        image_batch=image_batch,
-        export_formats=export_formats,
-        job_id=job_id,
-        storage_target=storage_target,
-        access=access,
-        prefix=prefix,
-        gpu_request=gpu_request,
-        ttl_seconds=ttl_seconds,
-        results_url=results_url,
-        download_base_url=download_base_url,
-    )
-
-
-@app.function(gpu="l4", **_WORKER_KWARGS)
-def _process_job_on_l4(
-    image_batch: list[tuple[bytes, str]],
-    export_formats: Sequence[str],
-    job_id: str,
-    storage_target: str,
-    access: dict[str, str],
-    prefix: str,
-    gpu_request: str,
-    ttl_seconds: int,
-    results_url: str,
-    download_base_url: str,
-):
-    return _process_job_impl(
-        image_batch=image_batch,
-        export_formats=export_formats,
-        job_id=job_id,
-        storage_target=storage_target,
-        access=access,
-        prefix=prefix,
-        gpu_request=gpu_request,
-        ttl_seconds=ttl_seconds,
-        results_url=results_url,
-        download_base_url=download_base_url,
-    )
-
-
-@app.function(gpu="a100", **_WORKER_KWARGS)
-def _process_job_on_a100(
-    image_batch: list[tuple[bytes, str]],
-    export_formats: Sequence[str],
-    job_id: str,
-    storage_target: str,
-    access: dict[str, str],
-    prefix: str,
-    gpu_request: str,
-    ttl_seconds: int,
-    results_url: str,
-    download_base_url: str,
-):
-    return _process_job_impl(
-        image_batch=image_batch,
-        export_formats=export_formats,
-        job_id=job_id,
-        storage_target=storage_target,
-        access=access,
-        prefix=prefix,
-        gpu_request=gpu_request,
-        ttl_seconds=ttl_seconds,
-        results_url=results_url,
-        download_base_url=download_base_url,
-    )
-
-
-@app.function(gpu="h100", **_WORKER_KWARGS)
-def _process_job_on_h100(
-    image_batch: list[tuple[bytes, str]],
-    export_formats: Sequence[str],
-    job_id: str,
-    storage_target: str,
-    access: dict[str, str],
-    prefix: str,
-    gpu_request: str,
-    ttl_seconds: int,
-    results_url: str,
-    download_base_url: str,
-):
-    return _process_job_impl(
-        image_batch=image_batch,
-        export_formats=export_formats,
-        job_id=job_id,
-        storage_target=storage_target,
-        access=access,
-        prefix=prefix,
-        gpu_request=gpu_request,
-        ttl_seconds=ttl_seconds,
-        results_url=results_url,
-        download_base_url=download_base_url,
-    )
-
-
-_GPU_JOB_DISPATCH = {
-    "a10": _process_job_on_a10,
-    "t4": _process_job_on_t4,
-    "l4": _process_job_on_l4,
-    "a100": _process_job_on_a100,
-    "h100": _process_job_on_h100,
-}
-
 _SAFE_JOB_ID = re.compile(r"[^a-zA-Z0-9._-]+")
 _RESULTS_ROOT = Path(PROGRESS_VOLUME_PATH) / "results"
 
@@ -335,8 +304,9 @@ _RESULTS_ROOT = Path(PROGRESS_VOLUME_PATH) / "results"
 _MANIFEST_LOCKS: dict[str, threading.Lock] = {}
 _MANIFEST_LOCKS_GUARD = threading.Lock()
 
-# Global lock for volume commits (shared with progress.py's _COMMIT_LOCK pattern)
-_VOLUME_COMMIT_LOCK = threading.Lock()
+# Serializes Volume reload/read/commit within a container. The web app serves many
+# requests concurrently, and a Volume reload must not race open file reads.
+_VOLUME_COMMIT_LOCK = threading.RLock()
 
 _UPSERT_MAX_RETRIES = 3
 _UPSERT_RETRY_DELAY = 0.4
@@ -372,34 +342,16 @@ def _manifest_path(job_id: str) -> Path:
     return _result_dir(job_id) / "manifest.json"
 
 
-def _endpoint_url_from_submit_url(submit_url: str, endpoint_slug: str) -> str:
-    """Build endpoint URL for Modal unique endpoint hosts.
-
-    Converts:
-      https://<user>--<app>-process-image.modal.run
-    into:
-      https://<user>--<app>-<endpoint_slug>.modal.run
-    """
-    base = submit_url.strip().rstrip("/")
-    needle = "-process-image.modal.run"
-    if base.endswith(needle):
-        return f"{base[:-len(needle)]}-{endpoint_slug}.modal.run"
-    return base
-
-
-def _build_endpoint_urls(request: Request, job_id: str) -> dict[str, str]:
-    submit_base = str(request.base_url).rstrip("/")
+def _build_endpoint_urls(base_url: str, job_id: str) -> dict[str, str]:
+    """URLs for a job on the unified API app (``https://<user>--<app>-api.modal.run``)."""
+    base = base_url.rstrip("/")
     job_id_q = quote(job_id, safe="")
-
-    status_base = _endpoint_url_from_submit_url(submit_base, "get-progress")
-    results_base = _endpoint_url_from_submit_url(submit_base, "get-results")
-    download_base = _endpoint_url_from_submit_url(submit_base, "download-result")
-
     return {
-        "submit_url": submit_base,
-        "status_url": f"{status_base}/?job_id={job_id_q}",
-        "results_url": f"{results_base}/?job_id={job_id_q}",
-        "download_base_url": download_base,
+        "submit_url": f"{base}/process",
+        "status_url": f"{base}/progress?job_id={job_id_q}",
+        "results_url": f"{base}/results?job_id={job_id_q}",
+        "cancel_url": f"{base}/cancel?job_id={job_id_q}",
+        "download_base_url": f"{base}/download",
     }
 
 
@@ -462,7 +414,7 @@ def _upsert_temp_output(
         "name": filename,
         "size": len(file_bytes),
         "content_type": mimetypes.guess_type(filename)[0] or "application/octet-stream",
-        "download_url": f"{download_base_url}/?job_id={job_id_q}&name={filename_q}",
+        "download_url": f"{download_base_url}?job_id={job_id_q}&name={filename_q}",
     }
 
     lock = _get_manifest_lock(job_id)
@@ -531,16 +483,16 @@ def _load_manifest(job_id: str, *, reload: bool = True) -> dict | None:
     """
     import json
 
-    if reload:
-        progress_volume.reload()
-
-    path = _manifest_path(job_id)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
+    with _VOLUME_COMMIT_LOCK:
+        if reload:
+            progress_volume.reload()
+        path = _manifest_path(job_id)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
     if not isinstance(data, dict):
         return None
     return data
@@ -568,8 +520,12 @@ def _remove_job_results(job_id: str) -> None:
         _MANIFEST_LOCKS.pop(job_id, None)
 
 
-def _cleanup_job_results(job_id: str) -> None:
-    """Remove all temp result files, manifest, and progress for a job.
+def _cleanup_job_results(job_id: str, *, keep_progress: bool = False) -> None:
+    """Remove all temp result files and the manifest for a job, and its progress.
+
+    ``keep_progress=True`` leaves the progress snapshot and cancel flag in place.
+    Cancellation needs that: the flag is how the GPU loop learns to stop, and the
+    snapshot is how the frontend sees "cancelled" instead of a 404.
 
     Idempotent — safe to call multiple times or if already cleaned.
     """
@@ -583,10 +539,11 @@ def _cleanup_job_results(job_id: str) -> None:
     except OSError:
         logger.warning("Failed to rmtree results for %s", job_id, exc_info=True)
 
-    try:
-        delete_progress(job_id, commit=False)
-    except Exception:
-        logger.warning("Failed to delete progress for %s", job_id, exc_info=True)
+    if not keep_progress:
+        try:
+            delete_progress(job_id, commit=False)
+        except Exception:
+            logger.warning("Failed to delete progress for %s", job_id, exc_info=True)
 
     if removed:
         try:
@@ -613,7 +570,8 @@ def _cleanup_expired_results() -> int:
     """
     import json
 
-    progress_volume.reload()
+    with _VOLUME_COMMIT_LOCK:
+        progress_volume.reload()
     if not _RESULTS_ROOT.exists():
         return 0
 
@@ -682,7 +640,7 @@ def _cleanup_expired_results() -> int:
 
 
 @app.function(
-    schedule=modal.Period(days=1),
+    schedule=modal.Period(hours=1),
     **_MAINTENANCE_KWARGS,
 )
 def cleanup_expired_results_job() -> dict[str, int]:
@@ -824,7 +782,14 @@ def _process_job_impl(
     ttl_seconds: int,
     results_url: str,
     download_base_url: str,
+    predictor=None,
+    device=None,
 ) -> dict:
+    """Run one job: inference, then deliver each output as soon as it is ready.
+
+    ``predictor``/``device`` come from ``SharpWorker`` (loaded once per container).
+    When omitted (CPU fallback) the model is loaded for this call.
+    """
     total_steps = len(image_batch)
     files_expected = _expected_file_count(image_batch, export_formats)
 
@@ -1010,6 +975,8 @@ def _process_job_impl(
             file_errors=file_errors,
         )
         _run_batch_impl(
+            predictor=predictor,
+            device=device,
             image_batch=image_batch,
             export_formats=export_formats,
             job_id=job_id,
@@ -1039,8 +1006,8 @@ def _process_job_impl(
                 done=True,
                 status="cancelled",
             )
-            # Immediately clean up temp files on cancel
-            _cleanup_job_results(job_id)
+            # Remove temp files now; keep the cancelled status for the frontend.
+            _cleanup_job_results(job_id, keep_progress=True)
             return {
                 "job_id": job_id,
                 "result_type": result_type,
@@ -1108,68 +1075,35 @@ def _process_job_impl(
     return result
 
 
-@app.function(
-    **_WORKER_KWARGS,
-)
-def _process_job(
+# --------------------------------------------------------------------------- HTTP handlers
+#
+# Plain functions so the routing layer stays thin. Blocking calls (Dict, Volume,
+# spawn) run in FastAPI's threadpool; only form parsing is async.
+
+
+def _fail_validation(job_id: str, total_steps: int, detail: str) -> HTTPException:
+    write_status(
+        job_id,
+        status="failed",
+        phase="validation_failed",
+        step=0,
+        total_steps=total_steps,
+        message=detail,
+        done=True,
+        error=detail,
+    )
+    return HTTPException(status_code=400, detail=detail)
+
+
+def _submit_job(
+    *,
+    base_url: str,
     image_batch: list[tuple[bytes, str]],
-    export_formats: Sequence[str],
-    job_id: str,
-    storage_target: str,
-    access: dict[str, str],
-    prefix: str,
-    gpu_request: str,
-    ttl_seconds: int,
-    results_url: str,
-    download_base_url: str,
-) -> dict:
-    """Background job processor for async API flow."""
-    return _process_job_impl(
-        image_batch=image_batch,
-        export_formats=export_formats,
-        job_id=job_id,
-        storage_target=storage_target,
-        access=access,
-        prefix=prefix,
-        gpu_request=gpu_request,
-        ttl_seconds=ttl_seconds,
-        results_url=results_url,
-        download_base_url=download_base_url,
-    )
-
-
-@app.function(
-    **_WORKER_KWARGS,
-)
-@modal.fastapi_endpoint(method="POST")
-async def process_image(request: Request):
-    """Submit SHARP job and return immediately with a pollable job id."""
-
-    unauthorized = _authorize_request(request)
-    if unauthorized:
-        return unauthorized
-
-    form = await request.form()
-    uploads = form.getlist("file") or form.getlist("files")
-    if not uploads:
-        raise HTTPException(
-            status_code=400,
-            detail="Form field 'file' (or 'files') is required.",
-        )
-
-    image_batch: list[tuple[bytes, str]] = []
-    for upload in uploads:
-        filename = upload.filename or "upload.png"
-        image_bytes = await upload.read()
-        image_batch.append((image_bytes, filename))
-
-    job_id = (
-        form.get("jobId")
-        or form.get("job_id")
-        or f"job-{uuid.uuid4().hex}"
-    )
-    job_id = _sanitize_job_id(str(job_id))
-    endpoint_urls = _build_endpoint_urls(request, job_id)
+    form: dict[str, str],
+) -> JSONResponse:
+    """Validate a submission, spawn the worker, and return 202 with job URLs."""
+    job_id = _sanitize_job_id(str(form.get("jobId") or form.get("job_id") or f"job-{uuid.uuid4().hex}"))
+    endpoint_urls = _build_endpoint_urls(base_url, job_id)
     total_steps = len(image_batch)
     write_status(
         job_id,
@@ -1187,9 +1121,8 @@ async def process_image(request: Request):
     )
 
     formats_raw = form.get("format") or form.get("formats")
-    export_formats: Sequence[str]
-    if isinstance(formats_raw, str) and formats_raw.strip():
-        export_formats = [fmt.strip() for fmt in formats_raw.split(",") if fmt.strip()]
+    if formats_raw and formats_raw.strip():
+        export_formats: Sequence[str] = [f.strip() for f in formats_raw.split(",") if f.strip()]
     else:
         export_formats = DEFAULT_EXPORT_FORMATS
 
@@ -1197,30 +1130,14 @@ async def process_image(request: Request):
     storage_target = (form.get("storageTarget") or "").strip().lower()
     prefix = form.get("prefix") or ""
     logger.info("Received storageTarget=%r, prefix=%r", storage_target, prefix)
+    access = _parse_access_string(form.get("accessString") or form.get("access") or "")
 
-    access_string = form.get("accessString") or form.get("access") or ""
-    access = _parse_access_string(access_string)
-
-    # Pre-validate storage requirements before GPU work
+    # Pre-validate storage requirements before any GPU work
     if storage_target == "r2":
         required = ("s3Endpoint", "s3AccessKeyId", "s3SecretAccessKey", "s3Bucket")
         missing = [key for key in required if not access.get(key)]
         if missing:
-            logger.warning("R2 selected but missing fields: %s", missing)
-            write_status(
-                job_id,
-                status="failed",
-                phase="validation_failed",
-                step=0,
-                total_steps=total_steps,
-                message=f"Missing fields: {', '.join(missing)}",
-                done=True,
-                error=f"storageTarget=r2 requires: {', '.join(missing)}",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=f"storageTarget=r2 requires: {', '.join(missing)}",
-            )
+            raise _fail_validation(job_id, total_steps, f"storageTarget=r2 requires: {', '.join(missing)}")
     elif storage_target == "supabase":
         missing = []
         if not (access.get("supabaseUrl") or access.get("SUPABASE_URL")):
@@ -1228,35 +1145,19 @@ async def process_image(request: Request):
         if not (access.get("supabaseKey") or access.get("SUPABASE_KEY")):
             missing.append("supabaseKey")
         if missing:
-            logger.warning("Supabase selected but missing fields: %s", missing)
-            write_status(
-                job_id,
-                status="failed",
-                phase="validation_failed",
-                step=0,
-                total_steps=total_steps,
-                message=f"Missing fields: {', '.join(missing)}",
-                done=True,
-                error=f"storageTarget=supabase requires: {', '.join(missing)}",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=f"storageTarget=supabase requires: {', '.join(missing)}",
+            raise _fail_validation(
+                job_id, total_steps, f"storageTarget=supabase requires: {', '.join(missing)}"
             )
 
-    gpu_request = (form.get("gpu") or form.get("gpu_type") or "a10").strip().lower()
-    if gpu_request not in _GPU_JOB_DISPATCH and gpu_request not in {"cpu", "none"}:
-        write_status(
-            job_id,
-            status="failed",
-            phase="validation_failed",
-            step=0,
-            total_steps=total_steps,
-            message=f"Unsupported gpu: {gpu_request}",
-            done=True,
-            error=f"Unsupported gpu: {gpu_request}",
-        )
-        raise HTTPException(status_code=400, detail=f"Unsupported gpu: {gpu_request}")
+    gpu_request = (form.get("gpu") or form.get("gpu_type") or DEFAULT_GPU).strip().lower()
+    if gpu_request not in SUPPORTED_GPUS and gpu_request not in CPU_GPU_ALIASES:
+        raise _fail_validation(job_id, total_steps, f"Unsupported gpu: {gpu_request}")
+
+    ttl_raw = form.get("resultTtlSeconds") or form.get("ttlSeconds")
+    try:
+        ttl_seconds = int(ttl_raw) if ttl_raw else DEFAULT_RESULT_TTL_SECONDS
+    except ValueError:
+        raise _fail_validation(job_id, total_steps, "resultTtlSeconds must be an integer")
 
     write_status(
         job_id,
@@ -1266,28 +1167,16 @@ async def process_image(request: Request):
         total_steps=total_steps,
         message=f"Starting worker on {gpu_request.upper()}",
         done=False,
-        files=[],
-        result_files=[],
-        files_ready=0,
-        files_expected=0,
-        file_errors=[],
     )
 
-    ttl_raw = form.get("resultTtlSeconds") or form.get("ttlSeconds")
-    try:
-        ttl_seconds = int(ttl_raw) if ttl_raw else DEFAULT_RESULT_TTL_SECONDS
-    except ValueError:
-        raise HTTPException(status_code=400, detail="resultTtlSeconds must be an integer")
-
-    processor = _GPU_JOB_DISPATCH.get(gpu_request, _process_job)
-    call = processor.spawn(
+    call = _spawn_job(
+        gpu_request,
         image_batch=image_batch,
-        export_formats=export_formats,
+        export_formats=list(export_formats),
         job_id=job_id,
         storage_target=storage_target,
         access=access,
         prefix=prefix,
-        gpu_request=gpu_request,
         ttl_seconds=ttl_seconds,
         results_url=endpoint_urls["results_url"],
         download_base_url=endpoint_urls["download_base_url"],
@@ -1302,44 +1191,24 @@ async def process_image(request: Request):
             "submit_url": endpoint_urls["submit_url"],
             "status_url": endpoint_urls["status_url"],
             "results_url": endpoint_urls["results_url"],
-            "status_path": endpoint_urls["status_url"],
-            "results_path": endpoint_urls["results_url"],
+            "cancel_url": endpoint_urls["cancel_url"],
             "call_id": call.object_id,
         },
     )
 
 
-@app.function(
-    **_WORKER_KWARGS,
-)
-@modal.fastapi_endpoint(method="GET")
-def get_progress(request: Request, job_id: str):
-    """Return the latest progress snapshot for a job."""
-    unauthorized = _authorize_request(request)
-    if unauthorized:
-        return unauthorized
-
+def _get_progress(job_id: str) -> dict:
     progress = read_progress(job_id)
     if not progress:
         raise HTTPException(status_code=404, detail="Job not found")
     return progress
 
 
-@app.function(
-    **_WORKER_KWARGS,
-)
-@modal.fastapi_endpoint(method="POST")
-def cancel_job(request: Request, job_id: str):
-    """Cancel a running job and clean up all related resources.
+def _cancel_job(job_id: str) -> dict:
+    """Flag the job as cancelled, mark progress, and remove temp results.
 
-    Writes a cancel sentinel to the progress volume so the GPU inference
-    loop stops at the next image boundary.  Immediately cleans up any
-    temp result files and marks the progress as cancelled.
+    The GPU loop sees the flag at the next image boundary.
     """
-    unauthorized = _authorize_request(request)
-    if unauthorized:
-        return unauthorized
-
     if not job_id or not job_id.strip():
         raise HTTPException(status_code=400, detail="job_id is required")
 
@@ -1347,7 +1216,6 @@ def cancel_job(request: Request, job_id: str):
     if not progress:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # If already done/cancelled, just return current state
     if progress.get("done"):
         return {
             "job_id": job_id,
@@ -1356,10 +1224,7 @@ def cancel_job(request: Request, job_id: str):
             "cancelled": progress.get("status") == "cancelled",
         }
 
-    # 1. Write the cancel sentinel so the GPU loop stops
     request_cancellation(job_id)
-
-    # 2. Update progress to cancelled immediately so the frontend sees it
     write_status(
         job_id,
         status="cancelled",
@@ -1368,12 +1233,9 @@ def cancel_job(request: Request, job_id: str):
         step=progress.get("step", 0),
         total_steps=progress.get("total_steps", 0),
         done=True,
-        commit=True,
     )
-
-    # 3. Clean up temp result files immediately
     try:
-        _cleanup_job_results(job_id)
+        _cleanup_job_results(job_id, keep_progress=True)
     except Exception:
         logger.warning("Failed cleanup during cancel for %s", job_id, exc_info=True)
 
@@ -1385,48 +1247,35 @@ def cancel_job(request: Request, job_id: str):
     }
 
 
-@app.function(
-    **_WORKER_KWARGS,
-)
-@modal.fastapi_endpoint(method="GET")
-def get_results(request: Request, job_id: str):
-    """Get result manifest or partial files for a job."""
-    unauthorized = _authorize_request(request)
-    if unauthorized:
-        return unauthorized
-
+def _get_results(job_id: str) -> dict:
     progress = read_progress(job_id) or {}
     if not progress:
         raise HTTPException(status_code=404, detail="Job not found")
 
     complete = bool(progress.get("done"))
-    result_type = str(progress.get("result_type") or "")
+    progress_files = progress.get("files", [])
+    if not isinstance(progress_files, list):
+        progress_files = []
 
-    if result_type == "cloud":
-        files = progress.get("files", [])
-        if not isinstance(files, list):
-            files = []
+    if str(progress.get("result_type") or "") == "cloud":
         return {
             "job_id": job_id,
             "complete": complete,
             "result_type": "cloud",
-            "files": files,
+            "files": progress_files,
             "file_errors": progress.get("file_errors", []),
         }
 
     manifest = _load_manifest(job_id)
     if not manifest:
-        files = progress.get("files", [])
-        if not isinstance(files, list):
-            files = []
-        if not files:
+        if not progress_files:
             raise HTTPException(status_code=404, detail="Results not found")
         return {
             "job_id": job_id,
             "complete": complete,
             "result_type": "temp",
             "expires_at": progress.get("expires_at"),
-            "files": files,
+            "files": progress_files,
             "file_errors": progress.get("file_errors", []),
         }
 
@@ -1444,126 +1293,139 @@ def get_results(request: Request, job_id: str):
     }
 
 
-@app.function(
-    **_WORKER_KWARGS,
-)
-@modal.fastapi_endpoint(method="GET")
-def download_result(request: Request, job_id: str, name: str, consume: bool = True):
-    """Download one temporary result file.
-
-    By default ``consume=true``, which deletes the file after it is read.
-    Concurrent downloads are safe: each request locks the manifest while
-    mutating it, and file bytes are read before any deletion.
-    """
+def _download_result(job_id: str, name: str, consume: bool) -> Response:
+    """Return one temporary result file; ``consume`` deletes it afterwards."""
     import json
 
-    unauthorized = _authorize_request(request)
-    if unauthorized:
-        return unauthorized
-
-    manifest = _load_manifest(job_id)
-    if not manifest:
-        raise HTTPException(status_code=404, detail="Results not found")
-    if _manifest_is_expired(manifest):
-        _remove_job_results(job_id)
-        raise HTTPException(status_code=404, detail="Results expired")
-
     target_name = Path(name).name
-    files = manifest.get("files", []) if isinstance(manifest, dict) else []
-    entry = None
-    for item in files:
-        if isinstance(item, dict) and item.get("name") == target_name:
-            entry = item
-            break
-    if entry is None:
-        raise HTTPException(status_code=404, detail="File not found")
+    with _VOLUME_COMMIT_LOCK:
+        manifest = _load_manifest(job_id)
+        if not manifest:
+            raise HTTPException(status_code=404, detail="Results not found")
+        if _manifest_is_expired(manifest):
+            _remove_job_results(job_id)
+            raise HTTPException(status_code=404, detail="Results expired")
 
-    file_path = _result_dir(job_id) / target_name
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
+        entry = next(
+            (i for i in manifest.get("files", []) if isinstance(i, dict) and i.get("name") == target_name),
+            None,
+        )
+        file_path = _result_dir(job_id) / target_name
+        if entry is None or not file_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
 
-    # Read file bytes BEFORE any mutations so concurrent commits can't
-    # invalidate the local filesystem view underneath us.
-    file_bytes = file_path.read_bytes()
-    media_type = entry.get("content_type") if isinstance(entry, dict) else None
-    if not isinstance(media_type, str) or not media_type:
-        media_type = mimetypes.guess_type(target_name)[0] or "application/octet-stream"
+        file_bytes = file_path.read_bytes()
+        media_type = entry.get("content_type")
+        if not isinstance(media_type, str) or not media_type:
+            media_type = mimetypes.guess_type(target_name)[0] or "application/octet-stream"
 
-    if consume:
-        lock = _get_manifest_lock(job_id)
-        with lock:
-            # Re-read manifest under lock — another download may have changed it
-            current_manifest = _load_manifest(job_id, reload=False) or manifest
-            current_files = current_manifest.get("files", [])
-            if not isinstance(current_files, list):
-                current_files = []
-
-            remaining = [
-                item
-                for item in current_files
-                if isinstance(item, dict) and item.get("name") != target_name
-            ]
-            current_manifest["files"] = remaining
-
+        remaining: list[dict] = []
+        if consume:
+            files = manifest.get("files", [])
+            remaining = [i for i in files if isinstance(i, dict) and i.get("name") != target_name]
+            manifest["files"] = remaining
             file_path.unlink(missing_ok=True)
-
             if remaining:
-                _manifest_path(job_id).write_text(
-                    json.dumps(current_manifest), encoding="utf-8"
-                )
+                _manifest_path(job_id).write_text(json.dumps(manifest), encoding="utf-8")
             else:
-                # Last file consumed — remove the entire result directory
-                result_dir = _result_dir(job_id)
-                if result_dir.exists():
-                    shutil.rmtree(result_dir, ignore_errors=True)
-
-        # Commit outside the lock
-        with _VOLUME_COMMIT_LOCK:
+                shutil.rmtree(_result_dir(job_id), ignore_errors=True)
             progress_volume.commit()
 
-        # Update progress so the frontend sees the updated file list.
-        # This is lightweight and non-critical — best-effort.
+    if consume:
+        # Best-effort: keep the polled file list in step with what is left.
         try:
             progress = read_progress(job_id) or {}
-            files_expected = progress.get("files_expected")
-            if not isinstance(files_expected, int):
-                files_expected = len(remaining)
-            total_steps = progress.get("total_steps")
-            if not isinstance(total_steps, int):
-                total_steps = 0
-            step = progress.get("step")
-            if not isinstance(step, int):
-                step = total_steps
-
-            write_status(
-                job_id,
-                status=str(progress.get("status") or "running"),
-                phase=str(progress.get("phase") or "uploading_or_staging_results"),
-                message=str(progress.get("message") or "Updated result files"),
-                step=step,
-                total_steps=total_steps,
-                done=bool(progress.get("done")),
-                result_type=str(progress.get("result_type") or "temp"),
-                files=remaining,
-                result_files=remaining,
-                files_ready=len(remaining),
-                files_expected=files_expected,
-                file_errors=progress.get("file_errors", []),
-                expires_at=current_manifest.get("expires_at"),
-                results_url=progress.get("results_url"),
-                results_path=progress.get("results_path"),
-                commit=False,  # Already committed above
-            )
+            if remaining:
+                write_status(
+                    job_id,
+                    status=str(progress.get("status") or "running"),
+                    files=remaining,
+                    result_files=remaining,
+                    files_ready=len(remaining),
+                )
+            else:
+                delete_progress(job_id)
         except Exception:
             logger.warning("Failed updating progress after consume for %s", job_id, exc_info=True)
-
-        # If all files consumed, clean up the progress file too
-        if not remaining:
-            try:
-                delete_progress(job_id, commit=True)
-            except Exception:
-                pass  # Cron will catch it
 
     response = Response(content=file_bytes, media_type=media_type)
     response.headers["Content-Disposition"] = _content_disposition_attachment(target_name)
     return response
+
+
+# --------------------------------------------------------------------------- web app
+
+
+def create_web_app():
+    """Build the FastAPI app. Separate from ``api`` so it can be tested locally."""
+    from fastapi import Depends, FastAPI
+    from fastapi.concurrency import run_in_threadpool
+    from fastapi.middleware.cors import CORSMiddleware
+
+    web = FastAPI(title="SHARP API", docs_url=None, redoc_url=None, openapi_url=None)
+    # Modal adds permissive CORS to fastapi_endpoint functions automatically, but not
+    # to asgi_app. The browser frontend needs it (and X-API-KEY) to keep working.
+    web.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Disposition"],
+    )
+
+    def require_api_key(request: Request) -> None:
+        if _authorize_request(request) is not None:
+            raise HTTPException(status_code=401)
+
+    auth = [Depends(require_api_key)]
+
+    @web.get("/health")
+    def health() -> dict:
+        return {"ok": True}
+
+    @web.post("/process", status_code=202, dependencies=auth)
+    async def process(request: Request):
+        form = await request.form()
+        uploads = form.getlist("file") or form.getlist("files")
+        if not uploads:
+            raise HTTPException(status_code=400, detail="Form field 'file' (or 'files') is required.")
+        image_batch = [(await u.read(), u.filename or "upload.png") for u in uploads]
+        fields = {k: v for k, v in form.items() if isinstance(v, str)}
+        return await run_in_threadpool(
+            _submit_job,
+            base_url=str(request.base_url),
+            image_batch=image_batch,
+            form=fields,
+        )
+
+    @web.get("/progress", dependencies=auth)
+    def progress(job_id: str):
+        return _get_progress(job_id)
+
+    @web.post("/cancel", dependencies=auth)
+    def cancel(job_id: str):
+        return _cancel_job(job_id)
+
+    @web.get("/results", dependencies=auth)
+    def results(job_id: str):
+        return _get_results(job_id)
+
+    @web.get("/download", dependencies=auth)
+    def download(job_id: str, name: str, consume: bool = True):
+        return _download_result(job_id, name, consume)
+
+    return web
+
+
+@app.function(
+    image=web_image,
+    secrets=_AUTH_SECRETS,
+    volumes={PROGRESS_VOLUME_PATH: progress_volume},
+    scaledown_window=WEB_SCALEDOWN_SECONDS,
+    timeout=300,
+)
+@modal.concurrent(max_inputs=WEB_MAX_CONCURRENT_REQUESTS)
+@modal.asgi_app()
+def api():
+    """All HTTP routes: https://<workspace>--ml-sharp-optimized-api.modal.run"""
+    return create_web_app()
