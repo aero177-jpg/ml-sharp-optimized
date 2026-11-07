@@ -82,34 +82,44 @@ uv run sharp cloud predict -i photo.jpg -o output/ --gpu h100  # $3.95/hr (faste
 | A100 | $2.50    | High performance  |
 | H100 | $3.95    | Fastest           |
 
-### Frontend Async Contract (Modal Endpoint URLs)
+### HTTP API
 
-Modal web endpoints in this app are exposed as unique URLs per function (for example,
-`https://<username>--ml-sharp-optimized-get-progress.modal.run/?job_id=...`), not as path routes under one host.
+All routes live on one FastAPI app: `https://<workspace>--ml-sharp-optimized-api.modal.run`.
+Send `X-API-KEY` on every request except `/health`.
 
-Frontend clients should:
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/process` | Submit images (multipart `file`/`files`); returns `202` |
+| `GET` | `/progress?job_id=` | Poll status; includes files as they become ready |
+| `POST` | `/cancel?job_id=` | Cancel; the worker stops at the next image |
+| `GET` | `/results?job_id=` | File list for the job |
+| `GET` | `/download?job_id=&name=[&consume=false]` | Download one temporary result file |
+| `GET` | `/health` | Liveness check, no auth |
 
-- Use `status_url` as the canonical polling endpoint; `get_progress` now includes incremental `files` entries as each file becomes available.
-- Use `results_url` as a compatibility manifest endpoint (it mirrors current file availability and completion state).
-- Send `X-API-KEY` on all async requests: submit, progress polling, results lookup, and file download.
-- Treat `status_path`/`results_path` as compatibility aliases containing the same full URL values.
+`/process` form fields: `format` (comma-separated `sog`, `ply`, `splat`; default `sog`),
+`gpu` (`t4`, `l4`, `a10`, `a100`, `h100`, `cpu`; default `a10`), `storageTarget`
+(`r2`, `supabase`, or empty for temporary storage), `accessString`, `prefix`,
+`jobId`, `resultTtlSeconds`.
 
-`process_image` (`POST`) returns `202` with:
+The `202` response carries `job_id`, `submit_url`, `status_url`, `results_url`,
+`cancel_url` and `call_id`. Use the returned URLs rather than building them.
 
-- `job_id`
-- `submit_url`
-- `status_url`
-- `results_url`
-- `call_id`
+`/progress` includes incremental fields:
 
-`get_progress` (`GET`) includes incremental fields:
-
-- `files` / `result_files` (available-so-far outputs)
+- `files` / `result_files` (available-so-far outputs, each with a `download_url` for temporary storage)
 - `files_ready` / `files_expected`
 - `file_errors` (best-effort per-file failures)
+- `status`: `queued`, `running`, `complete`, `failed` or `cancelled`
 
-`get_results` (`GET`) returns the same files view for compatibility.
+### How the deployment is laid out
 
+- **GPU worker (`SharpWorker`)**: one Modal class for every GPU tier. The model loads once per
+  container inside a memory snapshot, so warm jobs skip model loading and cold starts restore
+  from the snapshot. GPU memory snapshots (a Modal alpha feature) are on by default; deploy
+  with `SHARP_GPU_SNAPSHOT=0` to snapshot on CPU instead.
+- **Web app (`api`)**: a slim image with no torch, serving many requests per container.
+- **Progress**: stored in the `sharp-job-progress` Modal Dict. Temporary result files are on
+  the `sharp-progress` Volume and are cleaned up hourly.
 
 ## Original README
 
