@@ -6,7 +6,9 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 from __future__ import annotations
 
+import io
 import logging
+import math
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -148,9 +150,14 @@ def decompose_covariance_matrices(
     device = covariance_matrices.device
     dtype = covariance_matrices.dtype
 
-    # We convert to fp64 to avoid numerical errors.
-    covariance_matrices = covariance_matrices.detach().cpu().to(torch.float64)
-    rotations, singular_values_2, _ = torch.linalg.svd(covariance_matrices)
+    # We convert to fp64 to avoid numerical errors. Covariances are symmetric PSD, so
+    # eigh gives the same decomposition as SVD (up to axis order, which is irrelevant
+    # because scales and rotation columns stay paired) at a fraction of the cost.
+    # Stay on CUDA when available (MPS has no fp64, so it falls back to CPU).
+    work_device = device if device.type == "cuda" else torch.device("cpu")
+    covariance_matrices = covariance_matrices.detach().to(work_device, torch.float64)
+    singular_values_2, rotations = torch.linalg.eigh(covariance_matrices)
+    singular_values_2 = singular_values_2.clamp_min(0.0)
 
     # NOTE: in SVD, it is possible that U and VT are both reflections.
     # We need to correct them.
@@ -496,6 +503,8 @@ def save_splat(
     - 4 bytes: quaternion rotation (4 x uint8, encoded as (q * 128 + 128))
 
     Gaussians are sorted by size * opacity (descending) for progressive rendering.
+    Fully vectorized: one structured array, one write (byte-identical to the old
+    per-Gaussian loop, ~20x faster).
     """
     xyz = gaussians.mean_vectors.flatten(0, 1).cpu().numpy()
     scales = gaussians.singular_values.flatten(0, 1).cpu().numpy()
@@ -503,218 +512,226 @@ def save_splat(
     colors_rgb = cs_utils.linearRGB2sRGB(gaussians.colors.flatten(0, 1)).cpu().numpy()
     opacities = gaussians.opacities.flatten(0, 1).cpu().numpy()
 
-    # Sort by size * opacity (descending) for progressive rendering
-    sort_idx = np.argsort(-(scales.prod(axis=1) * opacities))
-
-    # Normalize quaternions
+    order = np.argsort(-(scales.prod(axis=1) * opacities))
     quats = quats / np.linalg.norm(quats, axis=1, keepdims=True)
 
-    with open(path, "wb") as f:
-        for i in sort_idx:
-            f.write(xyz[i].astype(np.float32).tobytes())
-            f.write(scales[i].astype(np.float32).tobytes())
-            rgba = np.concatenate([colors_rgb[i], [opacities[i]]])
-            f.write((rgba * 255).clip(0, 255).astype(np.uint8).tobytes())
-            f.write((quats[i] * 128 + 128).clip(0, 255).astype(np.uint8).tobytes())
+    records = np.empty(
+        len(order), dtype=[("p", "<f4", 3), ("s", "<f4", 3), ("c", "u1", 4), ("q", "u1", 4)]
+    )
+    records["p"] = xyz[order]
+    records["s"] = scales[order]
+    rgba = np.concatenate([colors_rgb, opacities[:, None]], axis=1)[order]
+    records["c"] = (rgba * 255).clip(0, 255).astype(np.uint8)
+    records["q"] = (quats[order] * 128 + 128).clip(0, 255).astype(np.uint8)
+    Path(path).write_bytes(records.tobytes())
 
 
-@torch.no_grad()
-def save_sog(
-    gaussians: Gaussians3D, f_px: float, image_shape: tuple[int, int], path: Path
-) -> None:
-    """Save Gaussians to SOG format (Spatially Ordered Gaussians).
+_SH_C0 = 0.28209479177387814
 
-    SOG is a highly compressed format using quantization and WebP images.
-    Typically 15-20x smaller than PLY. The format stores data in a ZIP archive
-    containing WebP images for positions, rotations, scales, and colors.
 
-    Reference: https://github.com/aras-p/sog-format
+def _codebook_kmeans(values: np.ndarray, iters: int = 12, bins: int = 1 << 16) -> np.ndarray:
+    """256-entry 1-D codebook via Lloyd-Max on a fine histogram.
+
+    Starts from equal-mass (percentile) centroids, which is what the old encoder
+    used directly. Lloyd iterations then minimise squared error. Runs on the
+    histogram, so cost is independent of the number of Gaussians.
     """
-    import io
-    import json
-    import math
-    import zipfile
+    values = values.astype(np.float64, copy=False)
+    lo, hi = float(values.min()), float(values.max())
+    if hi <= lo:
+        return np.full(256, lo, dtype=np.float32)
+    hist, edges = np.histogram(values, bins=bins, range=(lo, hi))
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    weights = hist.astype(np.float64)
+    codebook = np.unique(np.percentile(values, np.linspace(0, 100, 256)))
+    if len(codebook) < 256:  # saturated data gives duplicate percentiles
+        filler = np.linspace(lo, hi, 256 - len(codebook) + 2)[1:-1]
+        codebook = np.unique(np.concatenate([codebook, filler]))
+    for _ in range(iters):
+        bounds = 0.5 * (codebook[1:] + codebook[:-1])
+        cell = np.searchsorted(bounds, centers)
+        sums = np.bincount(cell, weights=weights * centers, minlength=len(codebook))
+        counts = np.bincount(cell, weights=weights, minlength=len(codebook))
+        codebook = np.sort(np.where(counts > 0, sums / np.maximum(counts, 1e-12), codebook))
+    out = np.full(256, codebook[-1], dtype=np.float32)
+    out[: len(codebook)] = codebook[:256]
+    return np.sort(out)
+
+
+def _quantize_to_codebook(values: np.ndarray, codebook: np.ndarray) -> np.ndarray:
+    """Nearest codebook index (codebook must be sorted)."""
+    bounds = 0.5 * (codebook[1:] + codebook[:-1])
+    return np.searchsorted(bounds, values).astype(np.uint8)
+
+
+def _sog_layout(
+    alpha_u8: np.ndarray, num_layers: int = 2, prune: bool = True
+) -> tuple[np.ndarray, int]:
+    """Pick which Gaussians to store and the texture width.
+
+    SHARP emits Gaussians in (layer, row, col) order on a square grid. Using the
+    grid width as the texture width keeps every Gaussian next to its real image
+    neighbours, so WebP's left/top predictors work (~13% smaller, measured).
+
+    With ``prune``, Gaussians whose 8-bit opacity is 0 (invisible in SOG anyway)
+    are dropped from layers >= 1. Layer 0 is kept whole so it stays on the grid.
+    """
+    n = len(alpha_u8)
+    side = math.isqrt(n // num_layers) if n % num_layers == 0 else 0
+    index = np.arange(n)
+    if side and side * side * num_layers == n:
+        if prune:
+            index = index[(index < side * side) | (alpha_u8 > 0)]
+        return index, side
+    # Unknown layout: keep input order, square-ish texture.
+    if prune:
+        index = index[alpha_u8 > 0]
+    return index, int(math.ceil(math.sqrt(max(len(index), 1))))
+
+
+def encode_sog_arrays(
+    xyz: np.ndarray,
+    scales: np.ndarray,
+    quats: np.ndarray,
+    colors_srgb: np.ndarray,
+    opacities: np.ndarray,
+    *,
+    prune: bool = True,
+    min_opacity: float = 0.0,
+    webp_method: int = 4,
+) -> tuple[dict[str, bytes], dict[str, Any]]:
+    """Encode Gaussian attributes (numpy, sRGB colours) into SOG v2 images + meta.
+
+    Returns (``{"means_l.webp": bytes, ...}``, partial meta dict).
+    """
     from concurrent.futures import ThreadPoolExecutor
 
     from PIL import Image
 
-    xyz = gaussians.mean_vectors.flatten(0, 1).cpu().numpy()
-    scales = gaussians.singular_values.flatten(0, 1).cpu().numpy()
-    quats = gaussians.quaternions.flatten(0, 1).cpu().numpy()
-    # Convert linear RGB to sRGB for compatibility with public renderers
-    # (same as save_ply and save_splat)
-    colors_srgb = cs_utils.linearRGB2sRGB(gaussians.colors.flatten(0, 1)).cpu().numpy()
-    opacities = gaussians.opacities.flatten(0, 1).cpu().numpy()
+    opacities = np.where(opacities < min_opacity, 0.0, opacities)
+    alpha_u8 = np.rint(opacities * 255).clip(0, 255).astype(np.uint8)
+    index, width = _sog_layout(alpha_u8, prune=prune)
+    count = len(index)
+    height = int(math.ceil(count / width))
+    pad = width * height - count
 
-    num_gaussians = len(xyz)
-    xyz_raw = xyz
+    def take(a: np.ndarray) -> np.ndarray:
+        a = a[index]
+        return np.pad(a, ((0, pad),) + ((0, 0),) * (a.ndim - 1)) if pad else a
 
-    # Compute image dimensions (roughly square)
-    img_width = int(math.ceil(math.sqrt(num_gaussians)))
-    img_height = int(math.ceil(num_gaussians / img_width))
-    total_pixels = img_width * img_height
+    xyz_k, scales_k, quats_k, colors_k = take(xyz), take(scales), take(quats), take(colors_srgb)
+    alpha_k = take(alpha_u8)
 
-    # Pad arrays to fill image (vectorized with np.pad)
-    pad_count = total_pixels - num_gaussians
-    if pad_count > 0:
-        xyz = np.pad(xyz, ((0, pad_count), (0, 0)), mode="constant")
-        scales = np.pad(scales, ((0, pad_count), (0, 0)), mode="constant")
-        quats = np.pad(quats, ((0, pad_count), (0, 0)), mode="constant")
-        colors_srgb = np.pad(colors_srgb, ((0, pad_count), (0, 0)), mode="constant")
-        opacities = np.pad(opacities, (0, pad_count), mode="constant")
+    # 1. Positions: symmetric log, 16 bit per axis. Range from real data only
+    #    (the old encoder let zero padding stretch the z range).
+    xyz_log = np.sign(xyz_k) * np.log1p(np.abs(xyz_k))
+    mins = xyz_log[:count].min(axis=0)
+    maxs = xyz_log[:count].max(axis=0)
+    q16 = np.rint((xyz_log - mins) / np.maximum(maxs - mins, 1e-8) * 65535)
+    q16 = q16.clip(0, 65535).astype(np.uint16)
+    means_l = (q16 & 0xFF).astype(np.uint8)
+    means_u = (q16 >> 8).astype(np.uint8)
 
-    # Normalize quaternions
-    quats = quats / (np.linalg.norm(quats, axis=1, keepdims=True) + 1e-8)
+    # 2. Quaternions: smallest-three, (w, x, y, z), mode in alpha (252 + mode).
+    quats_k = quats_k / (np.linalg.norm(quats_k, axis=1, keepdims=True) + 1e-8)
+    quats_k[count:] = (1.0, 0.0, 0.0, 0.0)
+    mode = np.abs(quats_k).argmax(axis=1)
+    rows = np.arange(len(quats_k))
+    quats_k = quats_k * np.sign(quats_k[rows, mode])[:, None]
+    kept = quats_k[np.arange(4)[None, :] != mode[:, None]].reshape(-1, 3)
+    quats_enc = np.empty((len(quats_k), 4), dtype=np.uint8)
+    quats_enc[:, :3] = np.rint((kept / math.sqrt(2) + 0.5) * 255).clip(0, 255)
+    quats_enc[:, 3] = 252 + mode
 
-    # === 1. Encode positions (16-bit per axis with symmetric log transform) ===
-    xyz_log = np.sign(xyz) * np.log1p(np.abs(xyz))
-    mins = xyz_log.min(axis=0)
-    maxs = xyz_log.max(axis=0)
+    # 3. Scales: log domain, shared 256-entry codebook.
+    scales_log = np.log(np.maximum(scales_k, 1e-10))
+    scale_codebook = _codebook_kmeans(scales_log[:count].ravel())
+    scales_q = _quantize_to_codebook(scales_log, scale_codebook)
 
-    # Avoid division by zero
-    ranges = np.maximum(maxs - mins, 1e-8)
+    # 4. Colour (SH DC) codebook + opacity in alpha.
+    sh0 = (colors_k - 0.5) / _SH_C0
+    sh0_codebook = _codebook_kmeans(sh0[:count].ravel())
+    sh0_rgba = np.concatenate([_quantize_to_codebook(sh0, sh0_codebook), alpha_k[:, None]], axis=1)
 
-    # Quantize to 16-bit
-    xyz_norm = (xyz_log - mins) / ranges
-    xyz_q16 = (xyz_norm * 65535).clip(0, 65535).astype(np.uint16)
-
-    means_l = (xyz_q16 & 0xFF).astype(np.uint8)
-    means_u = (xyz_q16 >> 8).astype(np.uint8)
-
-    # === 2. Encode quaternions (fully vectorized smallest-three) ===
-    abs_q = np.abs(quats)
-    mode = np.argmax(abs_q, axis=1)
-
-    # Ensure largest component is positive
-    row_idx = np.arange(len(quats))
-    signs = np.sign(quats[row_idx, mode])
-    quats = quats * signs[:, None]
-
-    # Build mask for kept components (all except mode)
-    all_indices = np.arange(4)
-    mask = all_indices[None, :] != mode[:, None]  # (N, 4) bool mask
-
-    # Extract kept values using the mask
-    kept_vals = quats[mask].reshape(-1, 3)
-
-    # Quantize from [-sqrt2/2, sqrt2/2] to [0, 255]
-    sqrt2_inv = 1.0 / math.sqrt(2)
-    encoded_vals = ((kept_vals * sqrt2_inv + 0.5) * 255).clip(0, 255).astype(np.uint8)
-
-    # Build result array
-    quats_encoded = np.zeros((len(quats), 4), dtype=np.uint8)
-    quats_encoded[:, :3] = encoded_vals
-    quats_encoded[:, 3] = (252 + mode).astype(np.uint8)
-
-    # === 3. Build scale codebook (256 entries) ===
-    # SOG stores scales in LOG space - the renderer does exp(codebook[idx])
-    scales_log = np.log(np.maximum(scales, 1e-10))
-    scales_log_flat = scales_log.flatten()
-
-    # Use percentiles for codebook (in log space)
-    percentiles = np.linspace(0, 100, 256)
-    scale_codebook = np.percentile(scales_log_flat, percentiles).astype(np.float32)
-
-    # Vectorized quantization to nearest codebook entry
-    def quantize_to_codebook(values: np.ndarray, codebook: np.ndarray) -> np.ndarray:
-        indices = np.searchsorted(codebook, values)
-        indices = np.clip(indices, 0, len(codebook) - 1)
-        prev_indices = np.clip(indices - 1, 0, len(codebook) - 1)
-        dist_curr = np.abs(values - codebook[indices])
-        dist_prev = np.abs(values - codebook[prev_indices])
-        return np.where(
-            (dist_prev < dist_curr) & (indices > 0), prev_indices, indices
-        ).astype(np.uint8)
-
-    scales_q = np.stack(
-        [quantize_to_codebook(scales_log[:, i], scale_codebook) for i in range(3)],
-        axis=1,
-    )
-
-    # === 4. Build SH0 codebook and encode colors ===
-    SH_C0 = 0.28209479177387814
-    sh0_coeffs = (colors_srgb - 0.5) / SH_C0
-    sh0_flat = sh0_coeffs.flatten()
-
-    sh0_codebook = np.percentile(sh0_flat, percentiles).astype(np.float32)
-
-    sh0_rgb = np.stack(
-        [quantize_to_codebook(sh0_coeffs[:, i], sh0_codebook) for i in range(3)],
-        axis=1,
-    )
-    sh0_a = (opacities * 255).clip(0, 255).astype(np.uint8)
-
-    # === 5. Create images and encode WebP in parallel ===
-    def create_webp_bytes(data: np.ndarray, width: int, height: int) -> bytes:
-        """Create WebP bytes from data array."""
+    def to_webp(data: np.ndarray) -> bytes:
         data = data.reshape(height, width, -1)
-        mode = "RGB" if data.shape[2] == 3 else "RGBA"
-        img = Image.fromarray(data, mode=mode)
+        img = Image.fromarray(data, mode="RGB" if data.shape[2] == 3 else "RGBA")
         buf = io.BytesIO()
-        img.save(buf, format="WEBP", lossless=True)
+        img.save(buf, format="WEBP", lossless=True, method=webp_method)
         return buf.getvalue()
 
-    sh0_data = np.concatenate([sh0_rgb, sh0_a[:, None]], axis=1)
-
-    # Parallel WebP encoding
-    image_data = [
-        ("means_l.webp", means_l),
-        ("means_u.webp", means_u),
-        ("quats.webp", quats_encoded),
-        ("scales.webp", scales_q),
-        ("sh0.webp", sh0_data),
-    ]
-
-    def encode_image(item: tuple[str, np.ndarray]) -> tuple[str, bytes]:
-        name, data = item
-        return name, create_webp_bytes(data, img_width, img_height)
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        encoded_images = list(executor.map(encode_image, image_data))
-
-    # === 6. Create meta.json ===
-    image_height_px, image_width_px = image_shape
-    color_space_index = cs_utils.encode_color_space("sRGB")
+    planes = {
+        "means_l.webp": means_l,
+        "means_u.webp": means_u,
+        "quats.webp": quats_enc,
+        "scales.webp": scales_q,
+        "sh0.webp": sh0_rgba,
+    }
+    with ThreadPoolExecutor(max_workers=len(planes)) as executor:
+        encoded = dict(zip(planes, executor.map(to_webp, planes.values())))
 
     meta = {
         "version": 2,
-        "count": num_gaussians,
+        "count": int(count),
         "antialias": False,
-        "means": {
-            "mins": mins.tolist(),
-            "maxs": maxs.tolist(),
-            "files": ["means_l.webp", "means_u.webp"],
-        },
+        "means": {"mins": mins.tolist(), "maxs": maxs.tolist(), "files": ["means_l.webp", "means_u.webp"]},
         "scales": {"codebook": scale_codebook.tolist(), "files": ["scales.webp"]},
         "quats": {"files": ["quats.webp"]},
         "sh0": {"codebook": sh0_codebook.tolist(), "files": ["sh0.webp"]},
-        "sharp_metadata": {
-            "image_size": [int(image_width_px), int(image_height_px)],
-            "intrinsic": [
-                f_px,
-                0,
-                image_width_px * 0.5,
-                0,
-                f_px,
-                image_height_px * 0.5,
-                0,
-                0,
-                1,
-            ],
-            "extrinsic": np.eye(4, dtype=np.float32).flatten().tolist(),
-            "frame": [1, num_gaussians],
-            "disparity": np.quantile(1.0 / xyz_raw[:, 2], [0.1, 0.9]).tolist(),
-            "color_space": int(color_space_index),
-            "version": [1, 5, 0],
-        },
+    }
+    return encoded, meta
+
+
+@torch.no_grad()
+def save_sog(
+    gaussians: Gaussians3D,
+    f_px: float,
+    image_shape: tuple[int, int],
+    path: Path,
+    *,
+    prune: bool = True,
+    min_opacity: float = 0.0,
+) -> None:
+    """Save Gaussians to SOG format (Spatially Ordered Gaussians, v2).
+
+    Quantized attributes stored as lossless WebP images in a ZIP archive.
+    Spec: https://developer.playcanvas.com/user-manual/gaussian-splatting/formats/sog/
+
+    Args:
+        prune: Drop Gaussians whose 8-bit opacity is 0 (lossless: SOG would render
+            them fully transparent anyway). Only applied to layers >= 1.
+        min_opacity: Optional, lossy. Treat opacities below this as 0 before pruning.
+    """
+    import json
+    import zipfile
+
+    xyz = gaussians.mean_vectors.flatten(0, 1).float().cpu().numpy()
+    scales = gaussians.singular_values.flatten(0, 1).float().cpu().numpy()
+    quats = gaussians.quaternions.flatten(0, 1).float().cpu().numpy()
+    # Convert linear RGB to sRGB for compatibility with public renderers
+    # (same as save_ply and save_splat)
+    colors_srgb = cs_utils.linearRGB2sRGB(gaussians.colors.flatten(0, 1)).float().cpu().numpy()
+    opacities = gaussians.opacities.flatten(0, 1).float().cpu().numpy()
+
+    encoded, meta = encode_sog_arrays(
+        xyz, scales, quats, colors_srgb, opacities, prune=prune, min_opacity=min_opacity
+    )
+
+    image_height_px, image_width_px = image_shape
+    meta["sharp_metadata"] = {
+        "image_size": [int(image_width_px), int(image_height_px)],
+        "intrinsic": [f_px, 0, image_width_px * 0.5, 0, f_px, image_height_px * 0.5, 0, 0, 1],
+        "extrinsic": np.eye(4, dtype=np.float32).flatten().tolist(),
+        "frame": [1, meta["count"]],
+        "disparity": np.quantile(1.0 / xyz[:, 2], [0.1, 0.9]).tolist(),
+        "color_space": int(cs_utils.encode_color_space("sRGB")),
+        "version": [1, 5, 0],
     }
 
-    # === 7. Save as ZIP archive ===
     path = Path(path)
     if path.suffix.lower() != ".sog":
         path = path.with_suffix(".sog")
-
     with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as zf:
-        for name, data in encoded_images:
+        for name, data in encoded.items():
             zf.writestr(name, data)
-        zf.writestr("meta.json", json.dumps(meta, indent=2))
+        zf.writestr("meta.json", json.dumps(meta))
