@@ -156,8 +156,10 @@ def _serialize_ply_to_bytes(
     ]
 
     num_gaussians = len(xyz)
-    elements = np.empty(num_gaussians, dtype=dtype_full)
-    elements[:] = list(map(tuple, attributes.detach().cpu().numpy()))
+    # Zero-copy: reinterpret the (N, 14) float32 block as structured records.
+    # The old list(map(tuple, ...)) path built ~1.2M Python tuples (~1.7 s).
+    attributes_np = np.ascontiguousarray(attributes.detach().cpu().numpy(), dtype=np.float32)
+    elements = attributes_np.view(np.dtype(dtype_full)).reshape(-1)
     vertex_elements = PlyElement.describe(elements, "vertex")
 
     image_height, image_width = image_shape
